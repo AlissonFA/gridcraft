@@ -289,7 +289,17 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                         for (col_offset, _) in t.columns.iter().enumerate() {
                             let col = t.range.start.col.saturating_add(col_offset as u32);
                             let target_cell = CellRef::new(r, col);
-                            if target_cell == c || sh_mut.cell(target_cell).is_some_and(|cl| !cl.is_blank()) {
+                            if target_cell == c {
+                                let prev_cell = CellRef::new(r.saturating_sub(1), col);
+                                let prev_style = sh_mut.style_id(prev_cell);
+                                if prev_style != gridcraft_model::StyleId::DEFAULT
+                                    && let Some(cell) = sh_mut.cells.get_mut(c)
+                                {
+                                    cell.style = prev_style;
+                                }
+                                continue;
+                            }
+                            if sh_mut.cell(target_cell).is_some_and(|cl| !cl.is_blank()) {
                                 continue;
                             }
                             let prev_cell = CellRef::new(r.saturating_sub(1), col);
@@ -561,6 +571,31 @@ mod tests {
         s.execute("home.bold", json!({"range": "A3"})).unwrap();
         let sh = s.doc().unwrap().wb.sheet(0).unwrap();
         assert_eq!(sh.tables[0].range.a1(), "A1:A2");
+    }
+
+    #[test]
+    fn table_auto_expand_row_inherits_date_and_number_formatting_on_expanding_cell() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Data", "Valor"]]})).unwrap();
+        s.execute("cell.set", json!({"cell": "A2", "input": "2026-10-10"})).unwrap();
+        s.execute("home.numberFormat", json!({"range": "A2", "code": "dd/mm/yyyy"})).unwrap();
+        s.execute("cell.set", json!({"cell": "B2", "input": 50})).unwrap();
+        s.execute("home.numberFormat", json!({"range": "B2", "format": "Currency"})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
+
+        let get = |s: &mut Session, a: &str| s.execute("cell.get", json!({"cell": a})).unwrap();
+        assert_eq!(get(&mut s, "A2")["text"], "10/10/2026");
+        assert_eq!(get(&mut s, "B2")["text"], "$50.00");
+
+        // Digitar em A3 (data no formato dd/mm/yyyy com dia > 12)
+        s.execute("cell.set", json!({"cell": "A3", "input": "15/10/2026"})).unwrap();
+        assert_eq!(get(&mut s, "A3")["text"], "15/10/2026");
+        assert_eq!(get(&mut s, "A3")["type"], "number");
+
+        // Digitar em B3 (número na coluna de moeda)
+        s.execute("cell.set", json!({"cell": "B3", "input": 75})).unwrap();
+        assert_eq!(get(&mut s, "B3")["text"], "$75.00");
     }
 }
 
