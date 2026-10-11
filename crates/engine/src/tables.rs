@@ -250,13 +250,14 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
     }
     let changed = cx.changed.clone();
     for (si, c) in changed {
-        let Some(sh) = cx.wb.sheet(si) else { continue };
-        let is_empty = sh.cell(c).is_none_or(|cell| cell.is_blank());
+        let (is_empty, tables) = match cx.wb.sheet(si) {
+            Some(sh) => (sh.cell(c).is_none_or(|cell| cell.is_blank()), sh.tables.clone()),
+            None => continue,
+        };
         if is_empty {
             continue;
         }
 
-        let tables = sh.tables.clone();
         for (ti, t) in tables.iter().enumerate() {
             // Expansão para baixo: linha imediatamente abaixo da tabela, dentro das colunas da tabela
             let is_row_below = c.row == t.range.end.row.saturating_add(1)
@@ -328,13 +329,56 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                     cx.touch(si, tc);
                 }
             }
+
+            // Expansão para a direita: coluna imediatamente à direita da tabela, dentro das linhas da tabela
+            let is_col_right = c.col == t.range.end.col.saturating_add(1)
+                && c.row >= t.range.start.row
+                && c.row <= t.range.end.row;
+
+            if is_col_right {
+                let new_range = RangeRef::new(t.range.start, CellRef::new(t.range.end.row, c.col));
+                let overlaps = tables.iter().enumerate().any(|(oi, ot)| oi != ti && ot.range.intersects(&new_range));
+                if overlaps {
+                    continue;
+                }
+
+                // Determinar nome do cabeçalho
+                let header_cell = CellRef::new(t.range.start.row, c.col);
+                let (header_name, write_header) = if c.row == t.range.start.row {
+                    let entered = cx.wb.sheet(si).map(|sh| sh.value(header_cell).display()).unwrap_or_default();
+                    let name = if entered.trim().is_empty() { format!("Column{}", t.columns.len() + 1) } else { entered };
+                    (name, false)
+                } else {
+                    let name = format!("Column{}", t.columns.len() + 1);
+                    (name, true)
+                };
+
+                if let Some(sh_mut) = cx.wb.sheet_mut(si) {
+                    if write_header {
+                        sh_mut.set_value(header_cell, gridcraft_core::Value::text(header_name.as_str()));
+                    }
+                    if let Some(tab_mut) = sh_mut.tables.get_mut(ti) {
+                        tab_mut.range = new_range;
+                        tab_mut.columns.push(TableColumn {
+                            name: header_name,
+                            totals: TotalsFn::None,
+                            totals_label: None,
+                            formula: None,
+                        });
+                        cx.structural = true;
+                    }
+                }
+                if write_header {
+                    cx.touch(si, header_cell);
+                }
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use gridcraft_core::Value;
+    use gridcraft_core::{CellRef, Value};
     use serde_json::json;
 
     use crate::Session;
@@ -420,6 +464,39 @@ mod tests {
         let sh = s.doc().unwrap().wb.sheet(0).unwrap();
         let val = sh.validations.iter().find(|v| v.ranges.iter().any(|r| r.contains(gridcraft_core::CellRef::new(2, 0))));
         assert!(val.is_some(), "Validação deve cobrir A3");
+    }
+
+    #[test]
+    fn table_auto_expands_column_when_typing_header_right() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B"], [1, 2]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
+
+        // Digitar novo cabeçalho em C1
+        s.execute("cell.set", json!({"cell": "C1", "input": "C"})).unwrap();
+
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        assert_eq!(sh.tables[0].range.a1(), "A1:C2");
+        assert_eq!(sh.tables[0].columns.len(), 3);
+        assert_eq!(sh.tables[0].columns[2].name, "C");
+    }
+
+    #[test]
+    fn table_auto_expands_column_when_typing_data_right_generates_header() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B"], [1, 2]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
+
+        // Digitar direto na linha de dados C2 sem preencher cabeçalho
+        s.execute("cell.set", json!({"cell": "C2", "input": 99})).unwrap();
+
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        assert_eq!(sh.tables[0].range.a1(), "A1:C2");
+        assert_eq!(sh.tables[0].columns.len(), 3);
+        assert_eq!(sh.tables[0].columns[2].name, "Column3");
+        assert_eq!(sh.value(CellRef::new(0, 2)), gridcraft_core::Value::from("Column3"));
     }
 }
 
