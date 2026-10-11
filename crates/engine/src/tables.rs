@@ -498,6 +498,74 @@ mod tests {
         assert_eq!(sh.tables[0].columns[2].name, "Column3");
         assert_eq!(sh.value(CellRef::new(0, 2)), gridcraft_core::Value::from("Column3"));
     }
+
+    #[test]
+    fn table_does_not_auto_expand_below_totals_row() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Num"], [10]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:A2", "header": true})).unwrap();
+        s.execute("table.totalRow", json!({"on": true})).unwrap();
+
+        // Tabela agora vai de A1:A3 (linha 3 é total)
+        // Digitar em A4 (logo abaixo do total) NÃO deve expandir a tabela
+        s.execute("cell.set", json!({"cell": "A4", "input": 999})).unwrap();
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        assert_eq!(sh.tables[0].range.a1(), "A1:A3");
+    }
+
+    #[test]
+    fn table_does_not_auto_expand_on_diagonal_edit() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B"], [1, 2]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
+
+        // C3 é diagonal inferior direita
+        s.execute("cell.set", json!({"cell": "C3", "input": "diag"})).unwrap();
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        assert_eq!(sh.tables[0].range.a1(), "A1:B2");
+    }
+
+    #[test]
+    fn table_does_not_auto_expand_if_overlapping_another_table() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["T1"], [1]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:A2", "header": true})).unwrap();
+
+        // Segunda tabela logo em A4:A5
+        s.execute("range.setValues", json!({"range": "A4", "values": [["T2"], [2]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A4:A5", "header": true})).unwrap();
+
+        // Digitar em A3 (entre T1 e T2): expandiria T1 para A1:A3.
+        // Se T2 começasse em A3, não poderia sobrepor. Testar com T2 em A3:A4
+        // Mas se digitarmos em A3 e T1 expandir para A1:A3, isso não colide com A4:A5.
+        // Se digitarmos em A3 e houver uma tabela em A3:A4, a expansão para A3 colide:
+        s.execute("edit.undo", json!({})).unwrap(); // desfaz T2
+        s.execute("insert.table", json!({"range": "A3:A4", "header": true})).unwrap();
+        // Agora T1 é A1:A2 e T2 é A3:A4.
+        // Digitar em A3 substituiria célula de T2 mas T1 não pode expandir sobre T2:
+        s.execute("cell.set", json!({"cell": "A3", "input": 50})).unwrap();
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        assert_eq!(sh.tables[0].range.a1(), "A1:A2");
+    }
+
+    #[test]
+    fn table_auto_expand_undo_reverts_cleanly() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A"], [1]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:A2", "header": true})).unwrap();
+
+        s.execute("cell.set", json!({"cell": "A3", "input": 2})).unwrap();
+        assert_eq!(s.doc().unwrap().wb.sheet(0).unwrap().tables[0].range.a1(), "A1:A3");
+
+        // Desfazer (Ctrl+Z)
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc().unwrap().wb.sheet(0).unwrap().tables[0].range.a1(), "A1:A2");
+        assert!(s.doc().unwrap().wb.sheet(0).unwrap().cell(gridcraft_core::CellRef::new(2, 0)).is_none());
+    }
 }
 
 #[cfg(test)]
