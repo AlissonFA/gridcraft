@@ -260,10 +260,7 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
 
         for (ti, t) in tables.iter().enumerate() {
             // Expansão para baixo: linha imediatamente abaixo da tabela, dentro das colunas da tabela
-            let is_row_below = c.row == t.range.end.row.saturating_add(1)
-                && c.col >= t.range.start.col
-                && c.col <= t.range.end.col
-                && !t.totals_row;
+            let is_row_below = c.row == t.range.end.row.saturating_add(1) && c.col >= t.range.start.col && c.col <= t.range.end.col && !t.totals_row;
 
             if is_row_below {
                 let new_range = RangeRef::new(t.range.start, CellRef::new(c.row, t.range.end.col));
@@ -282,10 +279,7 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
 
                     for val in &mut sh_mut.validations {
                         for vr in &mut val.ranges {
-                            if vr.end.row == old_end_row
-                                && vr.start.col >= t.range.start.col
-                                && vr.end.col <= t.range.end.col
-                            {
+                            if vr.end.row == old_end_row && vr.start.col >= t.range.start.col && vr.end.col <= t.range.end.col {
                                 vr.end.row = new_end_row;
                             }
                         }
@@ -313,11 +307,7 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                                         touched.push(target_cell);
                                     }
                                 } else if style != gridcraft_model::StyleId::DEFAULT {
-                                    let cell = Cell {
-                                        value: gridcraft_core::Value::Empty,
-                                        formula: None,
-                                        style,
-                                    };
+                                    let cell = Cell { value: gridcraft_core::Value::Empty, formula: None, style };
                                     sh_mut.set_cell(target_cell, cell);
                                 }
                             }
@@ -331,9 +321,7 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
             }
 
             // Expansão para a direita: coluna imediatamente à direita da tabela, dentro das linhas da tabela
-            let is_col_right = c.col == t.range.end.col.saturating_add(1)
-                && c.row >= t.range.start.row
-                && c.row <= t.range.end.row;
+            let is_col_right = c.col == t.range.end.col.saturating_add(1) && c.row >= t.range.start.row && c.row <= t.range.end.row;
 
             if is_col_right {
                 let new_range = RangeRef::new(t.range.start, CellRef::new(t.range.end.row, c.col));
@@ -359,12 +347,7 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                     }
                     if let Some(tab_mut) = sh_mut.tables.get_mut(ti) {
                         tab_mut.range = new_range;
-                        tab_mut.columns.push(TableColumn {
-                            name: header_name,
-                            totals: TotalsFn::None,
-                            totals_label: None,
-                            formula: None,
-                        });
+                        tab_mut.columns.push(TableColumn { name: header_name, totals: TotalsFn::None, totals_label: None, formula: None });
                         cx.structural = true;
                     }
                 }
