@@ -244,6 +244,43 @@ pub(crate) fn sync_headers(cx: &mut crate::cmd::Ctx) {
     cx.structural = true;
 }
 
+pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
+    if cx.wb.sheets.iter().all(|s| s.tables.is_empty()) || cx.changed.is_empty() {
+        return;
+    }
+    let changed = cx.changed.clone();
+    for (si, c) in changed {
+        let Some(sh) = cx.wb.sheet(si) else { continue };
+        let is_empty = sh.cell(c).is_none_or(|cell| cell.is_blank());
+        if is_empty {
+            continue;
+        }
+
+        let tables = sh.tables.clone();
+        for (ti, t) in tables.iter().enumerate() {
+            // Expansão para baixo: linha imediatamente abaixo da tabela, dentro das colunas da tabela
+            let is_row_below = c.row == t.range.end.row.saturating_add(1)
+                && c.col >= t.range.start.col
+                && c.col <= t.range.end.col
+                && !t.totals_row;
+
+            if is_row_below {
+                let new_range = RangeRef::new(t.range.start, CellRef::new(c.row, t.range.end.col));
+                // Checar se não sobrepõe outra tabela
+                let overlaps = tables.iter().enumerate().any(|(oi, ot)| oi != ti && ot.range.intersects(&new_range));
+                if overlaps {
+                    continue;
+                }
+                let Some(sh_mut) = cx.wb.sheet_mut(si) else { continue };
+                if let Some(tab_mut) = sh_mut.tables.get_mut(ti) {
+                    tab_mut.range = new_range;
+                    cx.structural = true;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use gridcraft_core::Value;
@@ -284,6 +321,21 @@ mod tests {
         s.execute("range.setValues", json!({"range": "A1", "values": [["a", "b"], [1, 2], [3, 4]]})).unwrap();
         s.execute("insert.table", json!({"range": "A1:B3", "header": true})).unwrap();
         assert_eq!(s.execute("edit.goTo", json!({"reference": "Table1"})).unwrap()["selection"], "A2:B3");
+    }
+
+    #[test]
+    fn table_auto_expands_row_when_typing_below() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Nome", "Idade"], ["Alice", 30]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
+
+        // Digitar na linha imediatamente abaixo (linha 3, índice 2 no 0-index / A3)
+        s.execute("cell.set", json!({"cell": "A3", "input": "Bob"})).unwrap();
+
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        assert_eq!(sh.tables.len(), 1);
+        assert_eq!(sh.tables[0].range.a1(), "A1:B3");
     }
 }
 
