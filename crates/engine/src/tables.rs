@@ -279,6 +279,17 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                         tab_mut.range = new_range;
                     }
 
+                    for val in &mut sh_mut.validations {
+                        for vr in &mut val.ranges {
+                            if vr.end.row == old_end_row
+                                && vr.start.col >= t.range.start.col
+                                && vr.end.col <= t.range.end.col
+                            {
+                                vr.end.row = new_end_row;
+                            }
+                        }
+                    }
+
                     for r in (old_end_row + 1)..=new_end_row {
                         for (col_offset, _) in t.columns.iter().enumerate() {
                             let col = t.range.start.col.saturating_add(col_offset as u32);
@@ -393,6 +404,22 @@ mod tests {
         let get = |s: &mut Session, a: &str| s.execute("cell.get", json!({"cell": a})).unwrap();
         assert_eq!(get(&mut s, "C3")["formula"], "=A3*B3");
         assert_eq!(get(&mut s, "C3")["value"], json!(60.0));
+    }
+
+    #[test]
+    fn table_auto_expand_row_extends_data_validation() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Status"], ["Ativo"]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:A2", "header": true})).unwrap();
+        s.execute("data.validation", json!({"range": "A2", "type": "list", "formula1": "Ativo,Inativo"})).unwrap();
+
+        // Digitar em A3
+        s.execute("cell.set", json!({"cell": "A3", "input": "Inativo"})).unwrap();
+
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        let val = sh.validations.iter().find(|v| v.ranges.iter().any(|r| r.contains(gridcraft_core::CellRef::new(2, 0))));
+        assert!(val.is_some(), "Validação deve cobrir A3");
     }
 }
 
