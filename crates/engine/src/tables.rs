@@ -251,7 +251,7 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
     let changed = cx.changed.clone();
     for (si, c) in changed {
         let (is_empty, tables) = match cx.wb.sheet(si) {
-            Some(sh) => (sh.cell(c).is_none_or(|cell| cell.is_blank()), sh.tables.clone()),
+            Some(sh) => (sh.cell(c).is_none_or(|cell| cell.value.is_empty() && cell.formula.is_none()), sh.tables.clone()),
             None => continue,
         };
         if is_empty {
@@ -548,6 +548,19 @@ mod tests {
         s.execute("edit.undo", json!({})).unwrap();
         assert_eq!(s.doc().unwrap().wb.sheet(0).unwrap().tables[0].range.a1(), "A1:A2");
         assert!(s.doc().unwrap().wb.sheet(0).unwrap().cell(gridcraft_core::CellRef::new(2, 0)).is_none());
+    }
+
+    #[test]
+    fn table_does_not_auto_expand_on_formatting_empty_cell() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A"], [1]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:A2", "header": true})).unwrap();
+
+        // Aplicar apenas negrito ou formato na célula A3 vazia
+        s.execute("home.bold", json!({"range": "A3"})).unwrap();
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        assert_eq!(sh.tables[0].range.a1(), "A1:A2");
     }
 }
 
