@@ -219,12 +219,7 @@ fn parse_date(t: &str, sys: DateSystem) -> Option<(f64, &'static str)> {
         }
         if let (Some(m), Some(d), Some(y)) = (num(a), num(b), num(c)) {
             let y = if c.len() <= 2 { if y < 30 { 2000 + y } else { 1900 + y } } else { y };
-            if let Some(ser) = valid_ymd(sys, y, m, d) {
-                return Some((ser, "m/d/yyyy"));
-            }
-            if let Some(ser) = valid_ymd(sys, y, d, m) {
-                return Some((ser, "d/m/yyyy"));
-            }
+            return valid_ymd(sys, y, m, d).map(|s| (s, "m/d/yyyy"));
         }
         // 4-Mar-2026
         if let (Some(d), Some(m), Some(y)) = (num(a), month_from_name(b), num(c)) {
@@ -238,17 +233,8 @@ fn parse_date(t: &str, sys: DateSystem) -> Option<(f64, &'static str)> {
         // the current year. We accept d-mmm / mmm-d only with month names, and m/d → current year.
         if let (Some(m), Some(d)) = (num(a), num(b)) {
             let y = current_year();
-            if (1..=12).contains(&m)
-                && (1..=31).contains(&d)
-                && let Some(ser) = valid_ymd(sys, y, m, d)
-            {
-                return Some((ser, "d-mmm"));
-            }
-            if (1..=12).contains(&d)
-                && (1..=31).contains(&m)
-                && let Some(ser) = valid_ymd(sys, y, d, m)
-            {
-                return Some((ser, "d-mmm"));
+            if (1..=12).contains(&m) && (1..=31).contains(&d) {
+                return valid_ymd(sys, y, m, d).map(|s| (s, "d-mmm"));
             }
             // m/yyyy
             if (1..=12).contains(&m) && b.len() == 4 {

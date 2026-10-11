@@ -248,28 +248,47 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
     if cx.wb.sheets.iter().all(|s| s.tables.is_empty()) || cx.changed.is_empty() {
         return;
     }
-    let changed = cx.changed.clone();
+    let mut changed = cx.changed.clone();
+    // Sort changed cells by sheet, column, then row so header rows are processed before data rows
+    changed.sort_by_key(|&(si, c)| (si, c.col, c.row));
+    changed.dedup();
+
     for (si, c) in changed {
-        let (is_empty, tables) = match cx.wb.sheet(si) {
-            Some(sh) => (sh.cell(c).is_none_or(|cell| cell.value.is_empty() && cell.formula.is_none()), sh.tables.clone()),
+        let is_empty = match cx.wb.sheet(si) {
+            Some(sh) => sh.cell(c).is_none_or(|cell| cell.value.is_empty() && cell.formula.is_none()),
             None => continue,
         };
         if is_empty {
             continue;
         }
 
-        for (ti, t) in tables.iter().enumerate() {
+        let num_tables = match cx.wb.sheet(si) {
+            Some(sh) => sh.tables.len(),
+            None => 0,
+        };
+
+        for ti in 0..num_tables {
+            // Read fresh table metadata directly from the sheet without cloning the tables collection
+            let (t_range, t_totals, num_columns, other_ranges) = match cx.wb.sheet(si) {
+                Some(sh) => match sh.tables.get(ti) {
+                    Some(t) => {
+                        let others: Vec<RangeRef> = sh.tables.iter().enumerate().filter(|(oi, _)| *oi != ti).map(|(_, ot)| ot.range).collect();
+                        (t.range, t.totals_row, t.columns.len(), others)
+                    }
+                    None => continue,
+                },
+                None => continue,
+            };
+
             // Downward expansion: row immediately below the table, within table columns
-            let is_row_below = c.row == t.range.end.row.saturating_add(1) && c.col >= t.range.start.col && c.col <= t.range.end.col && !t.totals_row;
+            let is_row_below = c.row == t_range.end.row.saturating_add(1) && c.col >= t_range.start.col && c.col <= t_range.end.col && !t_totals;
 
             if is_row_below {
-                let new_range = RangeRef::new(t.range.start, CellRef::new(c.row, t.range.end.col));
-                // Check if expansion overlaps another table
-                let overlaps = tables.iter().enumerate().any(|(oi, ot)| oi != ti && ot.range.intersects(&new_range));
-                if overlaps {
+                let new_range = RangeRef::new(t_range.start, CellRef::new(c.row, t_range.end.col));
+                if other_ranges.iter().any(|r| r.intersects(&new_range)) {
                     continue;
                 }
-                let old_end_row = t.range.end.row;
+                let old_end_row = t_range.end.row;
                 let new_end_row = c.row;
                 let mut touched = Vec::new();
                 if let Some(sh_mut) = cx.wb.sheet_mut(si) {
@@ -279,15 +298,15 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
 
                     for val in &mut sh_mut.validations {
                         for vr in &mut val.ranges {
-                            if vr.end.row == old_end_row && vr.start.col >= t.range.start.col && vr.end.col <= t.range.end.col {
+                            if vr.end.row == old_end_row && vr.start.col >= t_range.start.col && vr.end.col <= t_range.end.col {
                                 vr.end.row = new_end_row;
                             }
                         }
                     }
 
                     for r in (old_end_row + 1)..=new_end_row {
-                        for (col_offset, _) in t.columns.iter().enumerate() {
-                            let col = t.range.start.col.saturating_add(col_offset as u32);
+                        for col_offset in 0..num_columns {
+                            let col = t_range.start.col.saturating_add(col_offset as u32);
                             let target_cell = CellRef::new(r, col);
                             if target_cell == c {
                                 let prev_cell = CellRef::new(r.saturating_sub(1), col);
@@ -331,25 +350,20 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
             }
 
             // Rightward expansion: column immediately to the right of the table, within table rows
-            let is_col_right = c.col == t.range.end.col.saturating_add(1) && c.row >= t.range.start.row && c.row <= t.range.end.row;
+            let is_col_right = c.col == t_range.end.col.saturating_add(1) && c.row >= t_range.start.row && c.row <= t_range.end.row;
 
             if is_col_right {
-                let new_range = RangeRef::new(t.range.start, CellRef::new(t.range.end.row, c.col));
-                let overlaps = tables.iter().enumerate().any(|(oi, ot)| oi != ti && ot.range.intersects(&new_range));
-                if overlaps {
+                let new_range = RangeRef::new(t_range.start, CellRef::new(t_range.end.row, c.col));
+                if other_ranges.iter().any(|r| r.intersects(&new_range)) {
                     continue;
                 }
 
-                // Determine header name
-                let header_cell = CellRef::new(t.range.start.row, c.col);
-                let (header_name, write_header) = if c.row == t.range.start.row {
-                    let entered = cx.wb.sheet(si).map(|sh| sh.value(header_cell).display()).unwrap_or_default();
-                    let name = if entered.trim().is_empty() { format!("Column{}", t.columns.len() + 1) } else { entered };
-                    (name, false)
-                } else {
-                    let name = format!("Column{}", t.columns.len() + 1);
-                    (name, true)
-                };
+                // Determine header name: if the header cell already has content (entered in this edit
+                // or earlier), keep it without overwriting. Otherwise generate "Column{N}".
+                let header_cell = CellRef::new(t_range.start.row, c.col);
+                let entered = cx.wb.sheet(si).map(|sh| sh.value(header_cell).display()).unwrap_or_default();
+                let has_entered = !entered.trim().is_empty();
+                let (header_name, write_header) = if has_entered { (entered, false) } else { (format!("Column{}", num_columns + 1), true) };
 
                 if let Some(sh_mut) = cx.wb.sheet_mut(si) {
                     if write_header {
@@ -586,14 +600,51 @@ mod tests {
         assert_eq!(get(&mut s, "A2")["text"], "10/10/2026");
         assert_eq!(get(&mut s, "B2")["text"], "$50.00");
 
-        // Type in A3 (date in dd/mm/yyyy format with day > 12)
-        s.execute("cell.set", json!({"cell": "A3", "input": "15/10/2026"})).unwrap();
+        // Type in A3 (date in ISO format 2026-10-15; inherits dd/mm/yyyy display format)
+        s.execute("cell.set", json!({"cell": "A3", "input": "2026-10-15"})).unwrap();
         assert_eq!(get(&mut s, "A3")["text"], "15/10/2026");
         assert_eq!(get(&mut s, "A3")["type"], "number");
 
         // Type in B3 (number in currency column)
         s.execute("cell.set", json!({"cell": "B3", "input": 75})).unwrap();
         assert_eq!(get(&mut s, "B3")["text"], "$75.00");
+    }
+
+    #[test]
+    fn table_auto_expands_column_on_multi_cell_write_with_header() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B"], [1, 2]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
+
+        // Multi-cell write into column right (C1:C2 via setValues)
+        s.execute("range.setValues", json!({"range": "C1", "values": [["Status"], ["Active"]]})).unwrap();
+
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        assert_eq!(sh.tables[0].range.a1(), "A1:C2");
+        assert_eq!(sh.tables[0].columns.len(), 3);
+        assert_eq!(sh.tables[0].columns[2].name, "Status");
+        assert_eq!(sh.value(CellRef::new(0, 2)), gridcraft_core::Value::from("Status"));
+        assert_eq!(sh.value(CellRef::new(1, 2)), gridcraft_core::Value::from("Active"));
+    }
+
+    #[test]
+    fn table_auto_expands_column_on_multi_cell_write_without_header() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B"], [1, 2], [3, 4]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B3", "header": true})).unwrap();
+
+        // Multi-cell write into data rows only (C2:C3)
+        s.execute("range.setValues", json!({"range": "C2", "values": [[100], [200]]})).unwrap();
+
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        assert_eq!(sh.tables[0].range.a1(), "A1:C3");
+        assert_eq!(sh.tables[0].columns.len(), 3);
+        assert_eq!(sh.tables[0].columns[2].name, "Column3");
+        assert_eq!(sh.value(CellRef::new(0, 2)), gridcraft_core::Value::from("Column3"));
+        assert_eq!(sh.value(CellRef::new(1, 2)), gridcraft_core::Value::number(100.0));
+        assert_eq!(sh.value(CellRef::new(2, 2)), gridcraft_core::Value::number(200.0));
     }
 }
 
