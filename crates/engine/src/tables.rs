@@ -271,10 +271,50 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                 if overlaps {
                     continue;
                 }
-                let Some(sh_mut) = cx.wb.sheet_mut(si) else { continue };
-                if let Some(tab_mut) = sh_mut.tables.get_mut(ti) {
-                    tab_mut.range = new_range;
-                    cx.structural = true;
+                let old_end_row = t.range.end.row;
+                let new_end_row = c.row;
+                let mut touched = Vec::new();
+                if let Some(sh_mut) = cx.wb.sheet_mut(si) {
+                    if let Some(tab_mut) = sh_mut.tables.get_mut(ti) {
+                        tab_mut.range = new_range;
+                    }
+
+                    for r in (old_end_row + 1)..=new_end_row {
+                        for (col_offset, _) in t.columns.iter().enumerate() {
+                            let col = t.range.start.col.saturating_add(col_offset as u32);
+                            let target_cell = CellRef::new(r, col);
+                            if target_cell == c || sh_mut.cell(target_cell).is_some_and(|cl| !cl.is_blank()) {
+                                continue;
+                            }
+                            let prev_cell = CellRef::new(r.saturating_sub(1), col);
+                            let prev_info = sh_mut.cell(prev_cell).map(|cl| (cl.formula.clone(), cl.style));
+                            if let Some((formula, style)) = prev_info {
+                                if let Some(f) = formula {
+                                    if let Some(expr) = f.expr() {
+                                        let shifted = gridcraft_formula::adjust::shift_relative(expr, 1, 0);
+                                        let cell = Cell {
+                                            value: gridcraft_core::Value::Empty,
+                                            formula: Some(std::sync::Arc::new(Formula::from_expr(shifted))),
+                                            style,
+                                        };
+                                        sh_mut.set_cell(target_cell, cell);
+                                        touched.push(target_cell);
+                                    }
+                                } else if style != gridcraft_model::StyleId::DEFAULT {
+                                    let cell = Cell {
+                                        value: gridcraft_core::Value::Empty,
+                                        formula: None,
+                                        style,
+                                    };
+                                    sh_mut.set_cell(target_cell, cell);
+                                }
+                            }
+                        }
+                    }
+                }
+                cx.structural = true;
+                for tc in touched {
+                    cx.touch(si, tc);
                 }
             }
         }
@@ -336,6 +376,23 @@ mod tests {
         let sh = s.doc().unwrap().wb.sheet(0).unwrap();
         assert_eq!(sh.tables.len(), 1);
         assert_eq!(sh.tables[0].range.a1(), "A1:B3");
+    }
+
+    #[test]
+    fn table_auto_expand_row_propagates_formulas_and_styles() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Qtd", "Preco", "Total"], [2, 10, null]]})).unwrap();
+        s.execute("cell.set", json!({"cell": "C2", "input": "=A2*B2"})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:C2", "header": true})).unwrap();
+
+        // Adicionar novo item na linha 3 (A3=3, B3=20)
+        s.execute("cell.set", json!({"cell": "A3", "input": 3})).unwrap();
+        s.execute("cell.set", json!({"cell": "B3", "input": 20})).unwrap();
+
+        let get = |s: &mut Session, a: &str| s.execute("cell.get", json!({"cell": a})).unwrap();
+        assert_eq!(get(&mut s, "C3")["formula"], "=A3*B3");
+        assert_eq!(get(&mut s, "C3")["value"], json!(60.0));
     }
 }
 
