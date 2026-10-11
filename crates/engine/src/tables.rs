@@ -259,12 +259,12 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
         }
 
         for (ti, t) in tables.iter().enumerate() {
-            // Expansão para baixo: linha imediatamente abaixo da tabela, dentro das colunas da tabela
+            // Downward expansion: row immediately below the table, within table columns
             let is_row_below = c.row == t.range.end.row.saturating_add(1) && c.col >= t.range.start.col && c.col <= t.range.end.col && !t.totals_row;
 
             if is_row_below {
                 let new_range = RangeRef::new(t.range.start, CellRef::new(c.row, t.range.end.col));
-                // Checar se não sobrepõe outra tabela
+                // Check if expansion overlaps another table
                 let overlaps = tables.iter().enumerate().any(|(oi, ot)| oi != ti && ot.range.intersects(&new_range));
                 if overlaps {
                     continue;
@@ -330,7 +330,7 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                 }
             }
 
-            // Expansão para a direita: coluna imediatamente à direita da tabela, dentro das linhas da tabela
+            // Rightward expansion: column immediately to the right of the table, within table rows
             let is_col_right = c.col == t.range.end.col.saturating_add(1) && c.row >= t.range.start.row && c.row <= t.range.end.row;
 
             if is_col_right {
@@ -340,7 +340,7 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                     continue;
                 }
 
-                // Determinar nome do cabeçalho
+                // Determine header name
                 let header_cell = CellRef::new(t.range.start.row, c.col);
                 let (header_name, write_header) = if c.row == t.range.start.row {
                     let entered = cx.wb.sheet(si).map(|sh| sh.value(header_cell).display()).unwrap_or_default();
@@ -415,10 +415,10 @@ mod tests {
     fn table_auto_expands_row_when_typing_below() {
         let mut s = Session::new();
         s.new_workbook();
-        s.execute("range.setValues", json!({"range": "A1", "values": [["Nome", "Idade"], ["Alice", 30]]})).unwrap();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Name", "Age"], ["Alice", 30]]})).unwrap();
         s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
 
-        // Digitar na linha imediatamente abaixo (linha 3, índice 2 no 0-index / A3)
+        // Type in row immediately below (row 3, index 2 in 0-index / A3)
         s.execute("cell.set", json!({"cell": "A3", "input": "Bob"})).unwrap();
 
         let sh = s.doc().unwrap().wb.sheet(0).unwrap();
@@ -430,11 +430,11 @@ mod tests {
     fn table_auto_expand_row_propagates_formulas_and_styles() {
         let mut s = Session::new();
         s.new_workbook();
-        s.execute("range.setValues", json!({"range": "A1", "values": [["Qtd", "Preco", "Total"], [2, 10, null]]})).unwrap();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Qty", "Price", "Total"], [2, 10, null]]})).unwrap();
         s.execute("cell.set", json!({"cell": "C2", "input": "=A2*B2"})).unwrap();
         s.execute("insert.table", json!({"range": "A1:C2", "header": true})).unwrap();
 
-        // Adicionar novo item na linha 3 (A3=3, B3=20)
+        // Add new item in row 3 (A3=3, B3=20)
         s.execute("cell.set", json!({"cell": "A3", "input": 3})).unwrap();
         s.execute("cell.set", json!({"cell": "B3", "input": 20})).unwrap();
 
@@ -447,16 +447,16 @@ mod tests {
     fn table_auto_expand_row_extends_data_validation() {
         let mut s = Session::new();
         s.new_workbook();
-        s.execute("range.setValues", json!({"range": "A1", "values": [["Status"], ["Ativo"]]})).unwrap();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Status"], ["Active"]]})).unwrap();
         s.execute("insert.table", json!({"range": "A1:A2", "header": true})).unwrap();
-        s.execute("data.validation", json!({"range": "A2", "type": "list", "formula1": "Ativo,Inativo"})).unwrap();
+        s.execute("data.validation", json!({"range": "A2", "type": "list", "formula1": "Active,Inactive"})).unwrap();
 
-        // Digitar em A3
-        s.execute("cell.set", json!({"cell": "A3", "input": "Inativo"})).unwrap();
+        // Type in A3
+        s.execute("cell.set", json!({"cell": "A3", "input": "Inactive"})).unwrap();
 
         let sh = s.doc().unwrap().wb.sheet(0).unwrap();
         let val = sh.validations.iter().find(|v| v.ranges.iter().any(|r| r.contains(gridcraft_core::CellRef::new(2, 0))));
-        assert!(val.is_some(), "Validação deve cobrir A3");
+        assert!(val.is_some(), "Validation must cover A3");
     }
 
     #[test]
@@ -466,7 +466,7 @@ mod tests {
         s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B"], [1, 2]]})).unwrap();
         s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
 
-        // Digitar novo cabeçalho em C1
+        // Type new header in C1
         s.execute("cell.set", json!({"cell": "C1", "input": "C"})).unwrap();
 
         let sh = s.doc().unwrap().wb.sheet(0).unwrap();
@@ -482,7 +482,7 @@ mod tests {
         s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B"], [1, 2]]})).unwrap();
         s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
 
-        // Digitar direto na linha de dados C2 sem preencher cabeçalho
+        // Type directly in data row C2 without entering header
         s.execute("cell.set", json!({"cell": "C2", "input": 99})).unwrap();
 
         let sh = s.doc().unwrap().wb.sheet(0).unwrap();
@@ -500,8 +500,8 @@ mod tests {
         s.execute("insert.table", json!({"range": "A1:A2", "header": true})).unwrap();
         s.execute("table.totalRow", json!({"on": true})).unwrap();
 
-        // Tabela agora vai de A1:A3 (linha 3 é total)
-        // Digitar em A4 (logo abaixo do total) NÃO deve expandir a tabela
+        // Table now spans A1:A3 (row 3 is totals row)
+        // Typing in A4 (immediately below totals row) must NOT expand table
         s.execute("cell.set", json!({"cell": "A4", "input": 999})).unwrap();
         let sh = s.doc().unwrap().wb.sheet(0).unwrap();
         assert_eq!(sh.tables[0].range.a1(), "A1:A3");
@@ -514,7 +514,7 @@ mod tests {
         s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B"], [1, 2]]})).unwrap();
         s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
 
-        // C3 é diagonal inferior direita
+        // C3 is bottom-right diagonal
         s.execute("cell.set", json!({"cell": "C3", "input": "diag"})).unwrap();
         let sh = s.doc().unwrap().wb.sheet(0).unwrap();
         assert_eq!(sh.tables[0].range.a1(), "A1:B2");
@@ -527,18 +527,16 @@ mod tests {
         s.execute("range.setValues", json!({"range": "A1", "values": [["T1"], [1]]})).unwrap();
         s.execute("insert.table", json!({"range": "A1:A2", "header": true})).unwrap();
 
-        // Segunda tabela logo em A4:A5
+        // Second table in A4:A5
         s.execute("range.setValues", json!({"range": "A4", "values": [["T2"], [2]]})).unwrap();
         s.execute("insert.table", json!({"range": "A4:A5", "header": true})).unwrap();
 
-        // Digitar em A3 (entre T1 e T2): expandiria T1 para A1:A3.
-        // Se T2 começasse em A3, não poderia sobrepor. Testar com T2 em A3:A4
-        // Mas se digitarmos em A3 e T1 expandir para A1:A3, isso não colide com A4:A5.
-        // Se digitarmos em A3 e houver uma tabela em A3:A4, a expansão para A3 colide:
-        s.execute("edit.undo", json!({})).unwrap(); // desfaz T2
+        // Typing in A3 between T1 and T2 would expand T1 to A1:A3 if no overlap.
+        // If T2 starts at A3, expansion cannot overlap. Test collision with T2 at A3:A4:
+        s.execute("edit.undo", json!({})).unwrap(); // undo T2
         s.execute("insert.table", json!({"range": "A3:A4", "header": true})).unwrap();
-        // Agora T1 é A1:A2 e T2 é A3:A4.
-        // Digitar em A3 substituiria célula de T2 mas T1 não pode expandir sobre T2:
+        // Now T1 is A1:A2 and T2 is A3:A4.
+        // Typing in A3 would replace T2's cell, but T1 cannot expand over T2:
         s.execute("cell.set", json!({"cell": "A3", "input": 50})).unwrap();
         let sh = s.doc().unwrap().wb.sheet(0).unwrap();
         assert_eq!(sh.tables[0].range.a1(), "A1:A2");
@@ -554,7 +552,7 @@ mod tests {
         s.execute("cell.set", json!({"cell": "A3", "input": 2})).unwrap();
         assert_eq!(s.doc().unwrap().wb.sheet(0).unwrap().tables[0].range.a1(), "A1:A3");
 
-        // Desfazer (Ctrl+Z)
+        // Undo (Ctrl+Z)
         s.execute("edit.undo", json!({})).unwrap();
         assert_eq!(s.doc().unwrap().wb.sheet(0).unwrap().tables[0].range.a1(), "A1:A2");
         assert!(s.doc().unwrap().wb.sheet(0).unwrap().cell(gridcraft_core::CellRef::new(2, 0)).is_none());
@@ -567,7 +565,7 @@ mod tests {
         s.execute("range.setValues", json!({"range": "A1", "values": [["A"], [1]]})).unwrap();
         s.execute("insert.table", json!({"range": "A1:A2", "header": true})).unwrap();
 
-        // Aplicar apenas negrito ou formato na célula A3 vazia
+        // Apply only bold or format on empty cell A3
         s.execute("home.bold", json!({"range": "A3"})).unwrap();
         let sh = s.doc().unwrap().wb.sheet(0).unwrap();
         assert_eq!(sh.tables[0].range.a1(), "A1:A2");
@@ -577,7 +575,7 @@ mod tests {
     fn table_auto_expand_row_inherits_date_and_number_formatting_on_expanding_cell() {
         let mut s = Session::new();
         s.new_workbook();
-        s.execute("range.setValues", json!({"range": "A1", "values": [["Data", "Valor"]]})).unwrap();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Date", "Amount"]]})).unwrap();
         s.execute("cell.set", json!({"cell": "A2", "input": "2026-10-10"})).unwrap();
         s.execute("home.numberFormat", json!({"range": "A2", "code": "dd/mm/yyyy"})).unwrap();
         s.execute("cell.set", json!({"cell": "B2", "input": 50})).unwrap();
@@ -588,12 +586,12 @@ mod tests {
         assert_eq!(get(&mut s, "A2")["text"], "10/10/2026");
         assert_eq!(get(&mut s, "B2")["text"], "$50.00");
 
-        // Digitar em A3 (data no formato dd/mm/yyyy com dia > 12)
+        // Type in A3 (date in dd/mm/yyyy format with day > 12)
         s.execute("cell.set", json!({"cell": "A3", "input": "15/10/2026"})).unwrap();
         assert_eq!(get(&mut s, "A3")["text"], "15/10/2026");
         assert_eq!(get(&mut s, "A3")["type"], "number");
 
-        // Digitar em B3 (número na coluna de moeda)
+        // Type in B3 (number in currency column)
         s.execute("cell.set", json!({"cell": "B3", "input": 75})).unwrap();
         assert_eq!(get(&mut s, "B3")["text"], "$75.00");
     }
