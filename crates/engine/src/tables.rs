@@ -378,7 +378,14 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                     }
                     if let Some(tab_mut) = sh_mut.tables.get_mut(ti) {
                         tab_mut.range = new_range;
-                        tab_mut.columns.push(TableColumn { name: header_name, totals: TotalsFn::None, totals_label: None, formula: None });
+                        tab_mut.columns.push(TableColumn {
+                            name: header_name,
+                            totals: TotalsFn::None,
+                            totals_label: None,
+                            formula: None,
+                            unique_name: None,
+                            xml: None,
+                        });
                         cx.structural = true;
                     }
                 }
