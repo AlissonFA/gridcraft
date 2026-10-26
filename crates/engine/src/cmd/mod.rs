@@ -341,9 +341,10 @@ pub struct Ctx<'a> {
     /// Recalculate the whole workbook without making the edit structural: legacy arrays are still
     /// checked (a table that grew changes what its structured references cover).
     pub full_recalc: bool,
-    /// The command changed formats only (Format Painter, Paste Special › Formats): the cells it
-    /// touched hold no new entry, so tables next to them don't grow.
-    pub formats_only: bool,
+    /// The command enters data (typing, setValues, fill, paste): the cells it filled next to a
+    /// table grow it. Other commands that rewrite or move cells (sort, Format Painter, checkboxes)
+    /// leave tables as they are.
+    pub entry: bool,
 }
 
 pub(crate) fn edit<R>(s: &mut Session, f: impl FnOnce(&mut Ctx) -> Result<R>) -> Result<R> {
@@ -370,7 +371,7 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
         fit_rows: Vec::new(),
         protection_checked: false,
         full_recalc: false,
-        formats_only: false,
+        entry: false,
     };
     let r = f(&mut ctx)?;
     let Ctx { mut wb, changed, structural, mut fit_rows, protection_checked, full_recalc, .. } = ctx;

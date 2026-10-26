@@ -239,6 +239,7 @@ fn cell_set(s: &mut Session, p: &Json) -> Result<Json> {
     }
     let active_sheet = s.doc()?.wb.active_sheet();
     edit(s, |cx| {
+        cx.entry = true;
         if array {
             // Legacy Ctrl+Shift+Enter array formula over the selection, when the selection holds
             // the cell; a cell elsewhere (or on another sheet) gets a one-cell array.
@@ -314,6 +315,7 @@ fn range_set_values(s: &mut Session, p: &Json) -> Result<Json> {
     }
     let mut count = 0;
     edit(s, |cx| {
+        cx.entry = true;
         for (ri, row) in rows.iter().enumerate() {
             let cols: Vec<&Json> = match row.as_array() {
                 Some(a) => a.iter().collect(),
@@ -367,6 +369,7 @@ fn range_fill(s: &mut Session, p: &Json) -> Result<Json> {
     let input = str_param(p, "input").unwrap_or("").to_string();
     let origin = s.doc()?.selection.active;
     edit(s, |cx| {
+        cx.entry = true;
         // Each cell gets what typing the input there gives: the automatic number format where
         // it's General, its own format otherwise, text where it's Text. That depends only on
         // the cell's style, so the input is parsed once per style.
@@ -999,6 +1002,7 @@ fn paste_text(s: &mut Session, p: &Json, text: &str) -> Result<Json> {
     // only as far as the text's own shape, so spans in the markup can't expand without bound.
     let html = str_param(p, "html").map(|html| crate::clip_html::table_cells(html, h, w)).unwrap_or_default();
     edit(s, |cx| {
+        cx.entry = true;
         for (ri, row) in rows.iter().enumerate() {
             for (ci, v) in row.iter().enumerate() {
                 let Some(c) = at.offset(ri as i64, ci as i64) else { continue };
@@ -1143,8 +1147,8 @@ fn paste_special(s: &mut Session, p: &Json) -> Result<Json> {
     }
     edit(s, |cx| {
         // Notes and column widths write no cell, formats and validation none unless linked (a linked
-        // paste writes a formula into every cell): none of them is an entry that grows a table.
-        cx.formats_only = matches!(what, What::Comments | What::ColumnWidths) || (!link && matches!(what, What::Formats | What::Validation));
+        // paste writes a formula into every cell): only the rest is an entry that grows a table.
+        cx.entry = !(matches!(what, What::Comments | What::ColumnWidths) || (!link && matches!(what, What::Formats | What::Validation)));
         // Styles from another workbook must be re-interned.
         let mut style_map = std::collections::HashMap::new();
         let mut map_style = |id: StyleId, wb: &mut gridcraft_model::Workbook| -> StyleId {
@@ -1573,6 +1577,7 @@ fn fill_dir(s: &mut Session, p: &Json, dr: i64, dc: i64) -> Result<Json> {
         RangeRef::new(CellRef::new(r.start.row, r.end.col), r.end)
     };
     edit(s, |cx| {
+        cx.entry = true;
         crate::fill::fill(cx, sheet, src, r, crate::fill::FillMode::Copy)?;
         Ok(Json::Null)
     })
@@ -1604,6 +1609,7 @@ fn auto_fill(s: &mut Session, p: &Json) -> Result<Json> {
         return Err(bad("edit.autoFill", "the target must contain the source in one of its corners"));
     }
     edit(s, |cx| {
+        cx.entry = !matches!(mode, crate::fill::FillMode::Formats);
         crate::fill::fill(cx, sheet, src, target, mode)?;
         *cx.sel = crate::Selection { active: src.start, anchor: src.start, ranges: vec![target.union(&src)] };
         Ok(Json::Null)
@@ -1619,6 +1625,7 @@ fn fill_series(s: &mut Session, p: &Json) -> Result<Json> {
     let stop = f64_param(p, "stop");
     let unit = str_param(p, "dateUnit").unwrap_or("day").to_string();
     edit(s, |cx| {
+        cx.entry = true;
         crate::fill::series(cx, sheet, r, rows, &kind, step, stop, &unit)?;
         Ok(Json::Null)
     })
@@ -1627,7 +1634,10 @@ fn fill_series(s: &mut Session, p: &Json) -> Result<Json> {
 fn flash_fill(s: &mut Session, p: &Json) -> Result<Json> {
     let sheet = target_sheet(s, p)?;
     let r = target_range(s, p)?;
-    let n = edit(s, |cx| crate::fill::flash_fill(cx, sheet, r.start))?;
+    let n = edit(s, |cx| {
+        cx.entry = true;
+        crate::fill::flash_fill(cx, sheet, r.start)
+    })?;
     if n == 0 {
         return Err(EngineError::Other(
             "We looked at all the data next to your selection and didn't see a pattern for filling in values for you.".into(),
@@ -1826,7 +1836,6 @@ fn format_painter(s: &mut Session, p: &Json) -> Result<Json> {
         let dest_sheet = s.doc()?.wb.active_sheet();
         let same = std::sync::Arc::ptr_eq(&wb, &s.doc()?.wb) || s.doc()?.wb.styles == wb.styles;
         edit(s, |cx| {
-            cx.formats_only = true;
             let Some(src_sheet) = wb.sheet(sheet) else { return Ok(()) };
             let (h, w) = (src.height(), src.width());
             let dest = if dest.is_single() { RangeRef::new(dest.start, dest.start.offset_clamped(h as i64 - 1, w as i64 - 1)) } else { dest };

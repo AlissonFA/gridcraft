@@ -334,7 +334,7 @@ The inventory carried over from the 2026-10-07 ROADMAP.md, updated for what land
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-10-26 | minor | Tables grow as in Excel: typing, pasting or filling in the row below a table adds the row and fills its formulas, formats and validation down; in the column to its right it adds a column, named from its header cell or the lowest free `ColumnN` (#258). Format-only commands and protected sheets leave tables as they are; no score change |
+| 2026-10-26 | minor | Tables grow as in Excel: typing, pasting or filling in the row below a table adds the row and fills its calculated columns, formats and validation down; in the column to its right it adds a column, named from its header cell or the lowest free `ColumnN` (#258). Only commands that enter data grow a table: sorting, Format Painter, Paste Special › Formats, Fill › Formats Only and checkboxes leave it as it is, as do protected sheets; no score change |
 | 2026-10-22 | minor | Several windows on the desktop: a native window per workbook window, New Window on the same workbook, Switch Windows and Arrange All; "one window" removed from UI/UX fidelity, Hardware and the interaction-fidelity discount; no score change |
 | 2026-10-21 | minor | Page Setup paper sizes: `B4`/`B5`/`B6` are the JIS sizes Japanese Excel uses (ISO B4/B5/B6 by name), and Japanese Postcard, Japanese Double Postcard, the chou/kaku envelopes and A6 are added; PDF MediaBox and `file.print` follow, and the Size menu lists them |
 | 2026-10-18 | trivial | Stale chart notes: all chart kinds survive XLSX round-trip (PRs #158, #161) and trendlines landed |

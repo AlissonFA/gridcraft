@@ -254,9 +254,9 @@ pub(crate) fn sync_headers(cx: &mut crate::cmd::Ctx) {
 /// Grows a table over an entry made right next to it, as Excel's "Include new rows and columns in
 /// table" does: a cell filled in the row below adds the row (its formulas, formats and validation
 /// filled down), one in the column to the right adds a column. Totals rows, other tables, protected
-/// sheets and format-only commands stop it.
+/// sheets and commands that enter no data (sort, Format Painter, checkboxes) stop it.
 pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
-    if cx.formats_only || cx.wb.sheets.iter().all(|s| s.tables.is_empty()) || cx.changed.is_empty() {
+    if !cx.entry || cx.wb.sheets.iter().all(|s| s.tables.is_empty()) || cx.changed.is_empty() {
         return;
     }
     let mut changed = cx.changed.clone();
@@ -284,19 +284,24 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
 
         for ti in 0..num_tables {
             // Read fresh table metadata directly from the sheet without cloning the tables collection
-            let (t_range, t_totals, num_columns, other_ranges) = match cx.wb.sheet(si) {
-                Some(sh) => match sh.tables.get(ti) {
-                    Some(t) => {
-                        let others: Vec<RangeRef> = sh.tables.iter().enumerate().filter(|(oi, _)| *oi != ti).map(|(_, ot)| ot.range).collect();
-                        (t.range, t.totals_row, t.columns.len(), others)
-                    }
-                    None => continue,
-                },
-                None => continue,
+            let Some((t_range, t_totals, t_header, num_columns)) =
+                cx.wb.sheet(si).and_then(|sh| sh.tables.get(ti)).map(|t| (t.range, t.totals_row, t.header_row, t.columns.len()))
+            else {
+                continue;
             };
 
             // Downward expansion: row immediately below the table, within table columns
             let is_row_below = c.row == t_range.end.row.saturating_add(1) && c.col >= t_range.start.col && c.col <= t_range.end.col && !t_totals;
+            // Rightward expansion: column immediately to the right of the table, within table rows
+            let is_col_right = c.col == t_range.end.col.saturating_add(1) && c.row >= t_range.start.row && c.row <= t_range.end.row;
+            if !is_row_below && !is_col_right {
+                continue;
+            }
+            // Only now, for a cell next to this table: the ranges it must not grow over.
+            let other_ranges: Vec<RangeRef> = match cx.wb.sheet(si) {
+                Some(sh) => sh.tables.iter().enumerate().filter(|(oi, _)| *oi != ti).map(|(_, ot)| ot.range).collect(),
+                None => continue,
+            };
 
             if is_row_below {
                 let new_range = RangeRef::new(t_range.start, CellRef::new(c.row, t_range.end.col));
@@ -306,9 +311,16 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                 }
                 let old_end_row = t_range.end.row;
                 let new_end_row = c.row;
-                let new_cells: Vec<CellRef> = (old_end_row.saturating_add(1)..=new_end_row)
-                    .flat_map(|r| (0..num_columns).map(move |i| CellRef::new(r, t_range.start.col.saturating_add(i as u32))))
-                    .collect();
+                // Below a table with no data rows the row above is the header: the new row takes
+                // neither its format nor anything else from it.
+                let first_data_row = t_range.start.row.saturating_add(u32::from(t_header));
+                let new_cells: Vec<CellRef> = if old_end_row < first_data_row {
+                    Vec::new()
+                } else {
+                    (old_end_row.saturating_add(1)..=new_end_row)
+                        .flat_map(|r| (0..num_columns).map(move |i| CellRef::new(r, t_range.start.col.saturating_add(i as u32))))
+                        .collect()
+                };
                 // Cells whose own style is at most a number format (one typing a date or a percentage
                 // gives): an entry there takes the column's format; anything more was pasted on purpose.
                 let plain: std::collections::HashSet<CellRef> = match cx.wb.sheet(si) {
@@ -327,7 +339,11 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
 
                     for val in &mut sh_mut.validations {
                         for vr in &mut val.ranges {
-                            if vr.end.row == old_end_row && vr.start.col >= t_range.start.col && vr.end.col <= t_range.end.col {
+                            if old_end_row >= first_data_row
+                                && vr.end.row == old_end_row
+                                && vr.start.col >= t_range.start.col
+                                && vr.end.col <= t_range.end.col
+                            {
                                 vr.end.row = new_end_row;
                             }
                         }
@@ -351,10 +367,18 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                         // An empty cell takes the calculated column's formula, and the format of the
                         // cell above unless it was formatted already.
                         let style = if own_style != StyleId::DEFAULT { own_style } else { prev_style };
-                        // The copy keeps the dynamic-array mark, so a file saves it as Excel wrote it.
+                        // A column is calculated when its first data row holds the same formula as the
+                        // row above, moved: a formula typed into one cell only isn't filled down, as
+                        // in Excel. The copy keeps the dynamic-array mark (so a file saves it as Excel
+                        // wrote it) and a one-cell array stays an array.
+                        let first_cell = CellRef::new(first_data_row, target_cell.col);
+                        let first = sh_mut.cell(first_cell).and_then(|cl| cl.formula.as_ref()).and_then(|f| f.expr());
                         let shifted = sh_mut.cell(prev_cell).and_then(|cl| cl.formula.as_ref()).and_then(|f| {
-                            f.expr().map(|expr| Formula {
+                            let expr = f.expr()?;
+                            let moved = gridcraft_formula::adjust::shift_relative(first?, i64::from(prev_cell.row.saturating_sub(first_data_row)), 0);
+                            (moved == expr).then(|| Formula {
                                 dynamic: f.dynamic,
+                                array: f.array.filter(|a| a.is_single()).map(|_| RangeRef::new(target_cell, target_cell)),
                                 ..Formula::from_expr(gridcraft_formula::adjust::shift_relative(expr, 1, 0))
                             })
                         });
@@ -372,9 +396,6 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                     cx.touch(si, tc);
                 }
             }
-
-            // Rightward expansion: column immediately to the right of the table, within table rows
-            let is_col_right = c.col == t_range.end.col.saturating_add(1) && c.row >= t_range.start.row && c.row <= t_range.end.row;
 
             if is_col_right {
                 let new_range = RangeRef::new(t_range.start, CellRef::new(t_range.end.row, c.col));
@@ -971,6 +992,108 @@ mod tests {
         let sh = s.doc().unwrap().wb.sheet(0).unwrap();
         assert_eq!(sh.tables[0].range.a1(), "A1:C2");
         assert_eq!(sh.tables[0].columns.len(), 3);
+    }
+
+    /// A table on A1:B2 with data A3:B5 right below it, outside the table.
+    fn table_above_data() -> Session {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B"], [1, 2], [9, "note"], [3, "z"], [5, "y"]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
+        s
+    }
+
+    #[test]
+    fn table_does_not_auto_expand_on_commands_that_enter_no_data() {
+        // Sorting the data below moves its cells; it doesn't enter them.
+        let mut s = table_above_data();
+        s.execute("data.sort", json!({"range": "A3:B5", "header": false, "keys": [{"column": "A", "order": "asc"}]})).unwrap();
+        assert_eq!(range(&s), "A1:B2");
+
+        // Fill › Formats Only keeps the values below.
+        let mut s = table_above_data();
+        s.execute("edit.autoFill", json!({"source": "A2", "target": "A2:A3", "mode": "formats"})).unwrap();
+        assert_eq!(range(&s), "A1:B2");
+
+        // Checkboxes give empty cells FALSE as a control, not as typed data.
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A"], [1]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:A2", "header": true})).unwrap();
+        s.execute("insert.checkbox", json!({"range": "A3:A4"})).unwrap();
+        assert_eq!(range(&s), "A1:A2");
+    }
+
+    #[test]
+    fn table_auto_expands_on_every_way_of_entering_data() {
+        let grows = |cmd: &str, p: serde_json::Value| {
+            let mut s = Session::new();
+            s.new_workbook();
+            s.execute("range.setValues", json!({"range": "A1", "values": [["A"], [1], [null], [null]]})).unwrap();
+            s.execute("insert.table", json!({"range": "A1:A2", "header": true})).unwrap();
+            s.execute(cmd, p).unwrap();
+            assert_eq!(range(&s), "A1:A3", "{cmd}");
+        };
+        grows("cell.set", json!({"cell": "A3", "input": 2}));
+        grows("range.setValues", json!({"range": "A3", "values": [[2]]}));
+        grows("range.fill", json!({"range": "A3", "input": "2"}));
+        grows("edit.fillDown", json!({"range": "A2:A3"}));
+        grows("edit.autoFill", json!({"source": "A2", "target": "A2:A3"}));
+        grows("edit.fillSeries", json!({"range": "A2:A3", "type": "linear", "step": 1}));
+        grows("edit.paste", json!({"text": "2", "at": "A3"}));
+    }
+
+    #[test]
+    fn table_auto_expand_fills_only_calculated_columns() {
+        // B3 holds a formula typed into that cell only; B2 is a constant: B4 stays empty.
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B"], [1, 5], [2, null]]})).unwrap();
+        s.execute("cell.set", json!({"cell": "B3", "input": "=A3*2"})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B3", "header": true})).unwrap();
+        s.execute("cell.set", json!({"cell": "A4", "input": 3})).unwrap();
+        assert_eq!(range(&s), "A1:B4");
+        assert_eq!(s.execute("cell.get", json!({"cell": "B4"})).unwrap()["formula"], json!(null));
+
+        // The same formula on every data row is a calculated column: it fills down.
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B"], [1, null], [2, null]]})).unwrap();
+        s.execute("selection.set", json!({"range": "B2:B3"})).unwrap();
+        s.execute("range.fill", json!({"range": "B2:B3", "input": "=A2*2"})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B3", "header": true})).unwrap();
+        s.execute("cell.set", json!({"cell": "A4", "input": 3})).unwrap();
+        assert_eq!(s.execute("cell.get", json!({"cell": "B4"})).unwrap()["formula"], "=A4*2");
+    }
+
+    #[test]
+    fn table_auto_expand_below_a_header_only_table_takes_nothing_from_the_header() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B"]]})).unwrap();
+        s.execute("home.bold", json!({"range": "A1:B1"})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B1", "header": true})).unwrap();
+        s.execute("cell.set", json!({"cell": "A2", "input": "x"})).unwrap();
+        assert_eq!(range(&s), "A1:B2");
+        let doc = s.doc().unwrap();
+        let sh = doc.wb.sheet(0).unwrap();
+        for c in [CellRef::new(1, 0), CellRef::new(1, 1)] {
+            assert!(!doc.wb.styles.get(sh.style_id(c)).font.bold, "{c:?} isn't a header");
+        }
+    }
+
+    #[test]
+    fn table_auto_expand_keeps_a_one_cell_array_formula_an_array() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B"], [1, null]]})).unwrap();
+        s.execute("selection.set", json!({"range": "B2"})).unwrap();
+        s.execute("cell.set", json!({"cell": "B2", "input": "=SUM(A2:A2*2)", "array": true})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
+        s.execute("cell.set", json!({"cell": "A3", "input": 3})).unwrap();
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        let f = sh.cell(CellRef::new(2, 1)).and_then(|c| c.formula.clone()).unwrap();
+        assert_eq!(f.array, Some(gridcraft_core::RangeRef::new(CellRef::new(2, 1), CellRef::new(2, 1))));
     }
 }
 
