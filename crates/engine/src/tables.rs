@@ -260,14 +260,28 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
         return;
     }
     let mut changed = cx.changed.clone();
-    // Sort changed cells by sheet, column, then row so header rows are processed before data rows
-    changed.sort_by_key(|&(si, c)| (si, c.col, c.row));
+    changed.sort_unstable();
     changed.dedup();
     // Multi-cell legacy arrays per sheet, found once and only when a table may grow: a table can't
     // hold one (as `insert.table` refuses), so it doesn't grow over one.
     let mut arrays: std::collections::HashMap<usize, Vec<RangeRef>> = std::collections::HashMap::new();
 
-    for (si, c) in changed {
+    // Rows first, in row order, so each row of a pasted block meets the table already grown by the
+    // rows above it, whichever of its cells hold something; then columns, in column order, so a
+    // column's header is seen before its data.
+    for rows in [true, false] {
+        if rows {
+            changed.sort_unstable_by_key(|&(si, c)| (si, c.row, c.col));
+        } else {
+            changed.sort_unstable_by_key(|&(si, c)| (si, c.col, c.row));
+        }
+        expand_pass(cx, &changed, rows, &mut arrays);
+    }
+}
+
+/// One pass of [`auto_expand_tables`] over the entered cells: growing tables down (`rows`) or right.
+fn expand_pass(cx: &mut crate::cmd::Ctx, changed: &[(usize, CellRef)], rows: bool, arrays: &mut std::collections::HashMap<usize, Vec<RangeRef>>) {
+    for &(si, c) in changed {
         let is_empty = match cx.wb.sheet(si) {
             Some(sh) => sh.cell(c).is_none_or(|cell| cell.value.is_empty() && cell.formula.is_none()),
             None => continue,
@@ -291,9 +305,10 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
             };
 
             // Downward expansion: row immediately below the table, within table columns
-            let is_row_below = c.row == t_range.end.row.saturating_add(1) && c.col >= t_range.start.col && c.col <= t_range.end.col && !t_totals;
+            let is_row_below =
+                rows && c.row == t_range.end.row.saturating_add(1) && c.col >= t_range.start.col && c.col <= t_range.end.col && !t_totals;
             // Rightward expansion: column immediately to the right of the table, within table rows
-            let is_col_right = c.col == t_range.end.col.saturating_add(1) && c.row >= t_range.start.row && c.row <= t_range.end.row;
+            let is_col_right = !rows && c.col == t_range.end.col.saturating_add(1) && c.row >= t_range.start.row && c.row <= t_range.end.row;
             if !is_row_below && !is_col_right {
                 continue;
             }
@@ -1094,6 +1109,40 @@ mod tests {
         let sh = s.doc().unwrap().wb.sheet(0).unwrap();
         let f = sh.cell(CellRef::new(2, 1)).and_then(|c| c.formula.clone()).unwrap();
         assert_eq!(f.array, Some(gridcraft_core::RangeRef::new(CellRef::new(2, 1), CellRef::new(2, 1))));
+    }
+
+    #[test]
+    fn table_auto_expands_over_every_row_of_a_ragged_block() {
+        // The block's first row has its entry in B, its second row in A only: both rows join.
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B"], [1, 2]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
+        s.execute("range.setValues", json!({"range": "A3", "values": [[null, 1], [2, null]]})).unwrap();
+        assert_eq!(range(&s), "A1:B4");
+
+        // A block below and to the right grows the table down first, then right.
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B"], [1, 2]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
+        s.execute("range.setValues", json!({"range": "B3", "values": [[3, 4]]})).unwrap();
+        assert_eq!(range(&s), "A1:C3");
+    }
+
+    #[test]
+    fn table_auto_expands_on_autosum_below_it_for_one_cell_or_several() {
+        for range_param in [json!(null), json!("A2:A4")] {
+            let mut s = Session::new();
+            s.new_workbook();
+            s.execute("range.setValues", json!({"range": "A1", "values": [["A"], [1], [2]]})).unwrap();
+            s.execute("insert.table", json!({"range": "A1:A3", "header": true})).unwrap();
+            s.execute("selection.set", json!({"range": "A4"})).unwrap();
+            let p = if range_param.is_null() { json!({}) } else { json!({"range": range_param}) };
+            s.execute("formulas.autoSum", p).unwrap();
+            assert_eq!(range(&s), "A1:A4", "{range_param}");
+            assert_eq!(s.execute("cell.get", json!({"cell": "A4"})).unwrap()["formula"], "=SUM(A2:A3)");
+        }
     }
 }
 
