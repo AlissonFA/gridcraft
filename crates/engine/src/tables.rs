@@ -311,7 +311,7 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                         }
                     }
 
-                    for r in (old_end_row + 1)..=new_end_row {
+                    for r in old_end_row.saturating_add(1)..=new_end_row {
                         for col_offset in 0..num_columns {
                             let col = t_range.start.col.saturating_add(col_offset as u32);
                             let target_cell = CellRef::new(r, col);
@@ -365,16 +365,26 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                     continue;
                 }
 
-                // Determine header name: if the header cell already has content (entered in this edit
-                // or earlier), keep it without overwriting. Otherwise generate "Column{N}".
+                // The header cell names the column when it holds something (entered in this edit or
+                // earlier); otherwise the column gets the lowest free `ColumnN`, as in Excel. A table
+                // without a header row keeps the name on the column only: its first row is data.
                 let header_cell = CellRef::new(t_range.start.row, c.col);
-                let entered = cx.wb.sheet(si).map(|sh| sh.value(header_cell).display()).unwrap_or_default();
-                let has_entered = !entered.trim().is_empty();
-                let (header_name, write_header) = if has_entered { (entered, false) } else { (format!("Column{}", num_columns + 1), true) };
+                let (header_name, write_header) = match cx.wb.sheet(si) {
+                    Some(sh) => {
+                        let Some(t) = sh.tables.get(ti) else { continue };
+                        let entered = if t.header_row { sh.value(header_cell).display() } else { String::new() };
+                        let wanted = if entered.trim().is_empty() { "" } else { entered.as_str() };
+                        let name = unique_column_name(&t.columns, wanted);
+                        let write = t.header_row && name != entered;
+                        (name, write)
+                    }
+                    None => continue,
+                };
 
                 if let Some(sh_mut) = cx.wb.sheet_mut(si) {
                     if write_header {
-                        sh_mut.set_value(header_cell, gridcraft_core::Value::text(header_name.as_str()));
+                        let style = sh_mut.style_id(header_cell);
+                        sh_mut.set_cell(header_cell, Cell { value: gridcraft_core::Value::text(header_name.as_str()), style, ..Default::default() });
                     }
                     if let Some(tab_mut) = sh_mut.tables.get_mut(ti) {
                         tab_mut.range = new_range;
@@ -395,6 +405,22 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
             }
         }
     }
+}
+
+/// A name for a column added to a table: `wanted` when no column has it yet, `wanted2`, `wanted3`…
+/// when one does, and the lowest free `ColumnN` (from `Column1`) when nothing was wanted. Names
+/// compare without case, as structured references do.
+fn unique_column_name(columns: &[TableColumn], wanted: &str) -> String {
+    let taken: std::collections::HashSet<String> = columns.iter().map(|c| c.name.to_lowercase()).collect();
+    let free = |n: &str| !taken.contains(&n.to_lowercase());
+    if wanted.is_empty() {
+        // `columns.len() + 1` names cannot all be taken by `columns.len()` columns.
+        return (1..=columns.len().saturating_add(1)).map(|n| format!("Column{n}")).find(|n| free(n)).unwrap_or_default();
+    }
+    if free(wanted) {
+        return wanted.to_string();
+    }
+    (2..=columns.len().saturating_add(2)).map(|n| format!("{wanted}{n}")).find(|n| free(n)).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -516,8 +542,8 @@ mod tests {
         let sh = s.doc().unwrap().wb.sheet(0).unwrap();
         assert_eq!(sh.tables[0].range.a1(), "A1:C2");
         assert_eq!(sh.tables[0].columns.len(), 3);
-        assert_eq!(sh.tables[0].columns[2].name, "Column3");
-        assert_eq!(sh.value(CellRef::new(0, 2)), gridcraft_core::Value::from("Column3"));
+        assert_eq!(sh.tables[0].columns[2].name, "Column1");
+        assert_eq!(sh.value(CellRef::new(0, 2)), gridcraft_core::Value::from("Column1"));
     }
 
     #[test]
@@ -655,10 +681,95 @@ mod tests {
         let sh = s.doc().unwrap().wb.sheet(0).unwrap();
         assert_eq!(sh.tables[0].range.a1(), "A1:C3");
         assert_eq!(sh.tables[0].columns.len(), 3);
-        assert_eq!(sh.tables[0].columns[2].name, "Column3");
-        assert_eq!(sh.value(CellRef::new(0, 2)), gridcraft_core::Value::from("Column3"));
+        assert_eq!(sh.tables[0].columns[2].name, "Column1");
+        assert_eq!(sh.value(CellRef::new(0, 2)), gridcraft_core::Value::from("Column1"));
         assert_eq!(sh.value(CellRef::new(1, 2)), gridcraft_core::Value::number(100.0));
         assert_eq!(sh.value(CellRef::new(2, 2)), gridcraft_core::Value::number(200.0));
+    }
+
+    fn names(s: &Session) -> Vec<String> {
+        s.doc().unwrap().wb.sheet(0).unwrap().tables[0].columns.iter().map(|c| c.name.clone()).collect()
+    }
+
+    #[test]
+    fn table_auto_expand_generated_names_take_the_lowest_free_column_n() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B", "Column1"], [1, 2, 3]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:C2", "header": true})).unwrap();
+
+        // Column1 is taken, so typing in D2 names the new column Column2 (as Excel does), then E2 gets Column3.
+        s.execute("cell.set", json!({"cell": "D2", "input": 9})).unwrap();
+        s.execute("cell.set", json!({"cell": "E2", "input": 9})).unwrap();
+        assert_eq!(names(&s), ["A", "B", "Column1", "Column2", "Column3"]);
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        assert_eq!(sh.value(CellRef::new(0, 3)), Value::from("Column2"));
+        assert_eq!(sh.value(CellRef::new(0, 4)), Value::from("Column3"));
+    }
+
+    #[test]
+    fn table_auto_expand_typed_header_that_repeats_a_name_is_made_unique() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B"], [1, 2]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
+
+        s.execute("cell.set", json!({"cell": "C1", "input": "a"})).unwrap();
+        assert_eq!(names(&s), ["A", "B", "a2"]);
+        assert_eq!(s.doc().unwrap().wb.sheet(0).unwrap().value(CellRef::new(0, 2)), Value::from("a2"));
+    }
+
+    #[test]
+    fn table_auto_expand_column_without_header_row_leaves_the_first_row_as_data() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["x", "y"], [1, 2]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
+        // A header-less table (as opened from a file with headerRowCount="0") on A2:B3.
+        {
+            let sh = std::sync::Arc::make_mut(&mut s.active_mut().unwrap().wb).sheet_mut(0).unwrap();
+            sh.tables[0].header_row = false;
+            sh.tables[0].range = gridcraft_core::RangeRef::parse("A2:B3").unwrap();
+            sh.set_value(CellRef::new(2, 0), Value::number(3.0));
+            sh.set_value(CellRef::new(2, 1), Value::number(4.0));
+        }
+
+        // Typing in a lower data row of the new column writes no name into the first data row.
+        s.execute("cell.set", json!({"cell": "C3", "input": "x"})).unwrap();
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        assert_eq!(sh.tables[0].range.a1(), "A2:C3");
+        assert_eq!(sh.value(CellRef::new(1, 2)), Value::Empty);
+        assert_eq!(names(&s), ["x", "y", "Column1"]);
+
+        // A value typed into the first data row stays a value, not the column's name.
+        s.execute("cell.set", json!({"cell": "D2", "input": 42})).unwrap();
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        assert_eq!(sh.tables[0].range.a1(), "A2:D3");
+        assert_eq!(sh.value(CellRef::new(1, 3)), Value::number(42.0));
+        assert_eq!(names(&s), ["x", "y", "Column1", "Column2"]);
+    }
+
+    #[test]
+    fn table_auto_expand_with_existing_content_next_to_the_table() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B", "Notes"], [1, 2, "n"], ["Total", 3, null]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
+
+        // Formatting the existing cells beside and below leaves the table alone (observed in Excel).
+        s.execute("home.bold", json!({"range": "A3:B3"})).unwrap();
+        s.execute("home.bold", json!({"range": "C1:C2"})).unwrap();
+        assert_eq!(s.doc().unwrap().wb.sheet(0).unwrap().tables[0].range.a1(), "A1:B2");
+
+        // Retyping a value already below the table takes the row in, as Excel does.
+        s.execute("cell.set", json!({"cell": "A3", "input": "Total"})).unwrap();
+        assert_eq!(s.doc().unwrap().wb.sheet(0).unwrap().tables[0].range.a1(), "A1:B3");
+        // And so does retyping the existing header beside it; its text names the new column.
+        s.execute("cell.set", json!({"cell": "C1", "input": "Notes"})).unwrap();
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        assert_eq!(sh.tables[0].range.a1(), "A1:C3");
+        assert_eq!(sh.value(CellRef::new(1, 2)), Value::from("n"));
+        assert_eq!(names(&s), ["A", "B", "Notes"]);
     }
 }
 
