@@ -1142,7 +1142,9 @@ fn paste_special(s: &mut Session, p: &Json) -> Result<Json> {
         return Err(EngineError::Other("The cut area doesn't fit at this position; nothing was moved.".into()));
     }
     edit(s, |cx| {
-        cx.formats_only = matches!(what, What::Formats);
+        // Notes and column widths write no cell, formats and validation none unless linked (a linked
+        // paste writes a formula into every cell): none of them is an entry that grows a table.
+        cx.formats_only = matches!(what, What::Comments | What::ColumnWidths) || (!link && matches!(what, What::Formats | What::Validation));
         // Styles from another workbook must be re-interned.
         let mut style_map = std::collections::HashMap::new();
         let mut map_style = |id: StyleId, wb: &mut gridcraft_model::Workbook| -> StyleId {

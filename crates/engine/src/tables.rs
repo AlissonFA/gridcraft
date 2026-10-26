@@ -2,7 +2,7 @@
 //! `TableStyleLight1…21 / Medium1…28 / Dark1…11` names so files round-trip).
 
 use gridcraft_core::{CellRef, RangeRef};
-use gridcraft_model::{BorderLine, BorderStyle, Cell, Color, Fill, Formula, PatternType, Style, Table, TableColumn, TotalsFn, Workbook};
+use gridcraft_model::{BorderLine, BorderStyle, Cell, Color, Fill, Formula, PatternType, Style, StyleId, Table, TableColumn, TotalsFn, Workbook};
 
 /// (family, number) from a style name, e.g. `TableStyleMedium2` → ("Medium", 2).
 pub fn parse_style_name(name: &str) -> (&'static str, u32) {
@@ -263,6 +263,9 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
     // Sort changed cells by sheet, column, then row so header rows are processed before data rows
     changed.sort_by_key(|&(si, c)| (si, c.col, c.row));
     changed.dedup();
+    // Multi-cell legacy arrays per sheet, found once and only when a table may grow: a table can't
+    // hold one (as `insert.table` refuses), so it doesn't grow over one.
+    let mut arrays: std::collections::HashMap<usize, Vec<RangeRef>> = std::collections::HashMap::new();
 
     for (si, c) in changed {
         let is_empty = match cx.wb.sheet(si) {
@@ -297,11 +300,25 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
 
             if is_row_below {
                 let new_range = RangeRef::new(t_range.start, CellRef::new(c.row, t_range.end.col));
-                if other_ranges.iter().any(|r| r.intersects(&new_range)) {
+                let arr = arrays.entry(si).or_insert_with(|| cx.wb.sheet(si).map(multi_cell_arrays).unwrap_or_default());
+                if other_ranges.iter().chain(arr.iter()).any(|r| r.intersects(&new_range)) {
                     continue;
                 }
                 let old_end_row = t_range.end.row;
                 let new_end_row = c.row;
+                let new_cells: Vec<CellRef> = (old_end_row.saturating_add(1)..=new_end_row)
+                    .flat_map(|r| (0..num_columns).map(move |i| CellRef::new(r, t_range.start.col.saturating_add(i as u32))))
+                    .collect();
+                // Cells whose own style is at most a number format (one typing a date or a percentage
+                // gives): an entry there takes the column's format; anything more was pasted on purpose.
+                let plain: std::collections::HashSet<CellRef> = match cx.wb.sheet(si) {
+                    Some(sh) => new_cells
+                        .iter()
+                        .copied()
+                        .filter(|&tc| Style { num_fmt: Default::default(), ..cx.wb.styles.get(sh.style_id(tc)).clone() } == Style::default())
+                        .collect(),
+                    None => continue,
+                };
                 let mut touched = Vec::new();
                 if let Some(sh_mut) = cx.wb.sheet_mut(si) {
                     if let Some(tab_mut) = sh_mut.tables.get_mut(ti) {
@@ -316,42 +333,35 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                         }
                     }
 
-                    for r in old_end_row.saturating_add(1)..=new_end_row {
-                        for col_offset in 0..num_columns {
-                            let col = t_range.start.col.saturating_add(col_offset as u32);
-                            let target_cell = CellRef::new(r, col);
-                            if target_cell == c {
-                                let prev_cell = CellRef::new(r.saturating_sub(1), col);
-                                let prev_style = sh_mut.style_id(prev_cell);
-                                if prev_style != gridcraft_model::StyleId::DEFAULT
-                                    && let Some(cell) = sh_mut.cells.get_mut(c)
-                                {
-                                    cell.style = prev_style;
-                                }
-                                continue;
+                    for &target_cell in &new_cells {
+                        let prev_cell = CellRef::new(target_cell.row.saturating_sub(1), target_cell.col);
+                        let prev_style = sh_mut.style_id(prev_cell);
+                        let own_style = sh_mut.style_id(target_cell);
+                        // An entry made in the new row (by this command or before) keeps its value and
+                        // takes the column's format, unless it brought formatting of its own.
+                        if sh_mut.cell(target_cell).is_some_and(|cl| !cl.value.is_empty() || cl.formula.is_some()) {
+                            if prev_style != StyleId::DEFAULT
+                                && plain.contains(&target_cell)
+                                && let Some(cell) = sh_mut.cells.get_mut(target_cell)
+                            {
+                                cell.style = prev_style;
                             }
-                            if sh_mut.cell(target_cell).is_some_and(|cl| !cl.is_blank()) {
-                                continue;
-                            }
-                            let prev_cell = CellRef::new(r.saturating_sub(1), col);
-                            let prev_info = sh_mut.cell(prev_cell).map(|cl| (cl.formula.clone(), cl.style));
-                            if let Some((formula, style)) = prev_info {
-                                if let Some(f) = formula {
-                                    if let Some(expr) = f.expr() {
-                                        let shifted = gridcraft_formula::adjust::shift_relative(expr, 1, 0);
-                                        let cell = Cell {
-                                            value: gridcraft_core::Value::Empty,
-                                            formula: Some(std::sync::Arc::new(Formula::from_expr(shifted))),
-                                            style,
-                                        };
-                                        sh_mut.set_cell(target_cell, cell);
-                                        touched.push(target_cell);
-                                    }
-                                } else if style != gridcraft_model::StyleId::DEFAULT {
-                                    let cell = Cell { value: gridcraft_core::Value::Empty, formula: None, style };
-                                    sh_mut.set_cell(target_cell, cell);
-                                }
-                            }
+                            continue;
+                        }
+                        // An empty cell takes the calculated column's formula, and the format of the
+                        // cell above unless it was formatted already.
+                        let style = if own_style != StyleId::DEFAULT { own_style } else { prev_style };
+                        let shifted = sh_mut
+                            .cell(prev_cell)
+                            .and_then(|cl| cl.formula.as_ref())
+                            .and_then(|f| f.expr())
+                            .map(|expr| gridcraft_formula::adjust::shift_relative(expr, 1, 0));
+                        if let Some(shifted) = shifted {
+                            let formula = Some(std::sync::Arc::new(Formula::from_expr(shifted)));
+                            sh_mut.set_cell(target_cell, Cell { value: gridcraft_core::Value::Empty, formula, style });
+                            touched.push(target_cell);
+                        } else if style != own_style {
+                            sh_mut.set_cell(target_cell, Cell { value: gridcraft_core::Value::Empty, formula: None, style });
                         }
                     }
                 }
@@ -366,7 +376,8 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
 
             if is_col_right {
                 let new_range = RangeRef::new(t_range.start, CellRef::new(t_range.end.row, c.col));
-                if other_ranges.iter().any(|r| r.intersects(&new_range)) {
+                let arr = arrays.entry(si).or_insert_with(|| cx.wb.sheet(si).map(multi_cell_arrays).unwrap_or_default());
+                if other_ranges.iter().chain(arr.iter()).any(|r| r.intersects(&new_range)) {
                     continue;
                 }
 
@@ -426,6 +437,11 @@ fn unique_column_name(columns: &[TableColumn], wanted: &str) -> String {
         return wanted.to_string();
     }
     (2..=columns.len().saturating_add(2)).map(|n| format!("{wanted}{n}")).find(|n| free(n)).unwrap_or_default()
+}
+
+/// The ranges of the sheet's multi-cell legacy array formulas.
+fn multi_cell_arrays(sh: &gridcraft_model::Sheet) -> Vec<RangeRef> {
+    sh.cells.iter().filter_map(|(_, x)| x.formula.as_ref().and_then(|f| f.array)).filter(|a| !a.is_single()).collect()
 }
 
 #[cfg(test)]
@@ -834,6 +850,103 @@ mod tests {
         // B3 is part of the legacy array A3:B3: the edit is refused even though it sits below the table.
         assert!(s.execute("cell.set", json!({"cell": "B3", "input": 9})).is_err());
         assert_eq!(range(&s), "B1:B2");
+    }
+
+    #[test]
+    fn table_auto_expand_follows_what_paste_special_writes() {
+        let setup = || {
+            let mut s = Session::new();
+            s.new_workbook();
+            s.execute("range.setValues", json!({"range": "A1", "values": [["A"], [1], ["x"]]})).unwrap();
+            s.execute("insert.table", json!({"range": "A1:A2", "header": true})).unwrap();
+            s.execute("cell.set", json!({"cell": "D1", "input": "src"})).unwrap();
+            s.execute("review.newNote", json!({"cell": "D1", "text": "note"})).unwrap();
+            s.execute("data.validation", json!({"range": "D1", "type": "list", "formula1": "src,x"})).unwrap();
+            s.execute("selection.set", json!({"range": "D1"})).unwrap();
+            s.execute("edit.copy", json!({})).unwrap();
+            s.execute("selection.set", json!({"range": "A3"})).unwrap();
+            s
+        };
+        // Notes, validation and column widths write no entry into the filled cell below the table.
+        for what in ["comments", "validation", "columnWidths"] {
+            let mut s = setup();
+            s.execute("edit.pasteSpecial", json!({"what": what})).unwrap();
+            assert_eq!(range(&s), "A1:A2", "{what}");
+        }
+        // A linked paste writes a formula whatever it pastes: that is an entry.
+        let mut s = setup();
+        s.execute("edit.pasteSpecial", json!({"what": "formats", "link": true})).unwrap();
+        assert_eq!(range(&s), "A1:A3");
+    }
+
+    #[test]
+    fn table_auto_expand_fills_the_formula_into_a_formatted_empty_cell() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Qty", "Price", "Total"], [2, 10, null]]})).unwrap();
+        s.execute("cell.set", json!({"cell": "C2", "input": "=A2*B2"})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:C2", "header": true})).unwrap();
+        s.execute("home.bold", json!({"range": "C3"})).unwrap();
+
+        s.execute("cell.set", json!({"cell": "A3", "input": 3})).unwrap();
+        let get = |s: &mut Session, a: &str| s.execute("cell.get", json!({"cell": a})).unwrap();
+        assert_eq!(range(&s), "A1:C3");
+        assert_eq!(get(&mut s, "C3")["formula"], "=A3*B3");
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        assert!(s.doc().unwrap().wb.styles.get(sh.style_id(CellRef::new(2, 2))).font.bold, "C3 keeps its own format");
+    }
+
+    #[test]
+    fn table_auto_expand_gives_every_entry_of_the_new_row_the_column_format() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Item", "Price"], ["a", 50]]})).unwrap();
+        s.execute("home.numberFormat", json!({"range": "B2", "format": "Currency"})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
+
+        // One write fills the whole new row: B3 takes the currency format as A3 would.
+        s.execute("range.setValues", json!({"range": "A3", "values": [["b", 75]]})).unwrap();
+        assert_eq!(range(&s), "A1:B3");
+        assert_eq!(s.execute("cell.get", json!({"cell": "B3"})).unwrap()["text"], "$75.00");
+    }
+
+    #[test]
+    fn table_auto_expand_keeps_formatting_pasted_with_the_entry() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A"], [1]]})).unwrap();
+        s.execute("home.numberFormat", json!({"range": "A2", "format": "Currency"})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:A2", "header": true})).unwrap();
+        s.execute("cell.set", json!({"cell": "D1", "input": 5})).unwrap();
+        s.execute("home.bold", json!({"range": "D1"})).unwrap();
+
+        s.execute("selection.set", json!({"range": "D1"})).unwrap();
+        s.execute("edit.copy", json!({})).unwrap();
+        s.execute("selection.set", json!({"range": "A3"})).unwrap();
+        s.execute("edit.paste", json!({})).unwrap();
+        assert_eq!(range(&s), "A1:A3");
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        assert!(s.doc().unwrap().wb.styles.get(sh.style_id(CellRef::new(2, 0))).font.bold, "the pasted bold stays");
+    }
+
+    #[test]
+    fn table_does_not_auto_expand_over_a_multi_cell_array() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B", "C"], [1, 2, 3]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:C2", "header": true})).unwrap();
+        s.execute("selection.set", json!({"range": "B3:C3"})).unwrap();
+        s.execute("cell.set", json!({"cell": "B3", "input": "={1,2}", "array": true})).unwrap();
+        s.execute("cell.set", json!({"cell": "A3", "input": 4})).unwrap();
+        assert_eq!(range(&s), "A1:C2");
+
+        // Beside the table too: an array in D2:E2 keeps column D from being added.
+        s.execute("selection.set", json!({"range": "D2:E2"})).unwrap();
+        s.execute("cell.set", json!({"cell": "D2", "input": "={1,2}", "array": true})).unwrap();
+        s.execute("cell.set", json!({"cell": "D1", "input": "New"})).unwrap();
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        assert_eq!(sh.tables[0].range.a1(), "A1:C2");
+        assert_eq!(sh.tables[0].columns.len(), 3);
     }
 }
 
