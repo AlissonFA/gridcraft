@@ -351,13 +351,15 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                         // An empty cell takes the calculated column's formula, and the format of the
                         // cell above unless it was formatted already.
                         let style = if own_style != StyleId::DEFAULT { own_style } else { prev_style };
-                        let shifted = sh_mut
-                            .cell(prev_cell)
-                            .and_then(|cl| cl.formula.as_ref())
-                            .and_then(|f| f.expr())
-                            .map(|expr| gridcraft_formula::adjust::shift_relative(expr, 1, 0));
+                        // The copy keeps the dynamic-array mark, so a file saves it as Excel wrote it.
+                        let shifted = sh_mut.cell(prev_cell).and_then(|cl| cl.formula.as_ref()).and_then(|f| {
+                            f.expr().map(|expr| Formula {
+                                dynamic: f.dynamic,
+                                ..Formula::from_expr(gridcraft_formula::adjust::shift_relative(expr, 1, 0))
+                            })
+                        });
                         if let Some(shifted) = shifted {
-                            let formula = Some(std::sync::Arc::new(Formula::from_expr(shifted)));
+                            let formula = Some(std::sync::Arc::new(shifted));
                             sh_mut.set_cell(target_cell, Cell { value: gridcraft_core::Value::Empty, formula, style });
                             touched.push(target_cell);
                         } else if style != own_style {
@@ -927,6 +929,28 @@ mod tests {
         assert_eq!(range(&s), "A1:A3");
         let sh = s.doc().unwrap().wb.sheet(0).unwrap();
         assert!(s.doc().unwrap().wb.styles.get(sh.style_id(CellRef::new(2, 0))).font.bold, "the pasted bold stays");
+    }
+
+    #[test]
+    fn table_auto_expand_keeps_the_dynamic_array_mark_of_the_column_formula() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Qty", "Total"], [2, null]]})).unwrap();
+        s.execute("cell.set", json!({"cell": "B2", "input": "=SUM(A2:A2*2)"})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
+        // As read from a file that marks B2 as a dynamic-array formula.
+        {
+            let sh = std::sync::Arc::make_mut(&mut s.active_mut().unwrap().wb).sheet_mut(0).unwrap();
+            let cell = sh.cells.get_mut(CellRef::new(1, 1)).unwrap();
+            let f = cell.formula.as_ref().unwrap();
+            cell.formula = Some(std::sync::Arc::new(gridcraft_model::Formula { dynamic: true, ..(**f).clone() }));
+        }
+
+        s.execute("cell.set", json!({"cell": "A3", "input": 3})).unwrap();
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        let f = sh.cell(CellRef::new(2, 1)).and_then(|c| c.formula.clone()).unwrap();
+        assert_eq!(f.text, "SUM(A3:A3*2)");
+        assert!(f.dynamic);
     }
 
     #[test]
