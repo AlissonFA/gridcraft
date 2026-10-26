@@ -111,7 +111,7 @@ pub fn run(root: &Path, rest: &[&str]) -> Result<(), String> {
         if rest.contains(&"--check") {
             for (path, expected) in &generated {
                 let on_disk = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-                if on_disk.replace("\r\n", "\n") != expected.replace("\r\n", "\n") {
+                if on_disk != *expected {
                     return Err(format!("{} is out of date — run `cargo xtask keytips` and commit the result", path.display()));
                 }
                 println!("keytips: {} up to date", path.display());
