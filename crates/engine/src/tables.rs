@@ -251,8 +251,12 @@ pub(crate) fn sync_headers(cx: &mut crate::cmd::Ctx) {
     cx.structural = true;
 }
 
+/// Grows a table over an entry made right next to it, as Excel's "Include new rows and columns in
+/// table" does: a cell filled in the row below adds the row (its formulas, formats and validation
+/// filled down), one in the column to the right adds a column. Totals rows, other tables, protected
+/// sheets and format-only commands stop it.
 pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
-    if cx.wb.sheets.iter().all(|s| s.tables.is_empty()) || cx.changed.is_empty() {
+    if cx.formats_only || cx.wb.sheets.iter().all(|s| s.tables.is_empty()) || cx.changed.is_empty() {
         return;
     }
     let mut changed = cx.changed.clone();
@@ -269,9 +273,10 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
             continue;
         }
 
+        // Excel doesn't grow tables on a protected sheet: the new row's cells may be locked.
         let num_tables = match cx.wb.sheet(si) {
-            Some(sh) => sh.tables.len(),
-            None => 0,
+            Some(sh) if !sh.is_protected() => sh.tables.len(),
+            _ => 0,
         };
 
         for ti in 0..num_tables {
@@ -350,7 +355,7 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                         }
                     }
                 }
-                cx.structural = true;
+                cx.full_recalc = true;
                 for tc in touched {
                     cx.touch(si, tc);
                 }
@@ -396,7 +401,7 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                             unique_name: None,
                             xml: None,
                         });
-                        cx.structural = true;
+                        cx.full_recalc = true;
                     }
                 }
                 if write_header {
@@ -770,6 +775,65 @@ mod tests {
         assert_eq!(sh.tables[0].range.a1(), "A1:C3");
         assert_eq!(sh.value(CellRef::new(1, 2)), Value::from("n"));
         assert_eq!(names(&s), ["A", "B", "Notes"]);
+    }
+
+    fn range(s: &Session) -> String {
+        s.doc().unwrap().wb.sheet(0).unwrap().tables[0].range.a1()
+    }
+
+    #[test]
+    fn table_does_not_auto_expand_on_format_only_commands() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A"], [1], ["x"]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:A2", "header": true})).unwrap();
+        s.execute("cell.set", json!({"cell": "D1", "input": "src"})).unwrap();
+        s.execute("home.bold", json!({"range": "D1"})).unwrap();
+
+        // Format Painter onto the filled cell below the table.
+        s.execute("selection.set", json!({"range": "D1"})).unwrap();
+        s.execute("edit.formatPainter", json!({})).unwrap();
+        s.execute("edit.formatPainter", json!({"apply": "A3"})).unwrap();
+        assert_eq!(range(&s), "A1:A2");
+
+        // Paste Special › Formats onto it.
+        s.execute("selection.set", json!({"range": "D1"})).unwrap();
+        s.execute("edit.copy", json!({})).unwrap();
+        s.execute("selection.set", json!({"range": "A3"})).unwrap();
+        s.execute("edit.pasteSpecial", json!({"what": "formats"})).unwrap();
+        assert_eq!(range(&s), "A1:A2");
+    }
+
+    #[test]
+    fn table_does_not_auto_expand_on_a_protected_sheet() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B"], [1, null]]})).unwrap();
+        s.execute("cell.set", json!({"cell": "B2", "input": "=A2*2"})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
+        s.execute("home.lockCell", json!({"range": "A3", "on": false})).unwrap();
+        s.execute("review.protectSheet", json!({})).unwrap();
+
+        // The unlocked cell takes the entry; the table stays and no formula goes into locked B3.
+        s.execute("cell.set", json!({"cell": "A3", "input": 5})).unwrap();
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        assert_eq!(sh.tables[0].range.a1(), "A1:B2");
+        assert_eq!(sh.value(CellRef::new(2, 0)), Value::number(5.0));
+        assert!(sh.cell(CellRef::new(2, 1)).is_none_or(|c| c.formula.is_none()));
+    }
+
+    #[test]
+    fn table_auto_expand_keeps_part_of_an_array_from_being_changed() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "B1", "values": [["H"], [1]]})).unwrap();
+        s.execute("insert.table", json!({"range": "B1:B2", "header": true})).unwrap();
+        s.execute("selection.set", json!({"range": "A3:B3"})).unwrap();
+        s.execute("cell.set", json!({"cell": "A3", "input": "={1,2}", "array": true})).unwrap();
+
+        // B3 is part of the legacy array A3:B3: the edit is refused even though it sits below the table.
+        assert!(s.execute("cell.set", json!({"cell": "B3", "input": 9})).is_err());
+        assert_eq!(range(&s), "B1:B2");
     }
 }
 

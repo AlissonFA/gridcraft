@@ -1142,6 +1142,7 @@ fn paste_special(s: &mut Session, p: &Json) -> Result<Json> {
         return Err(EngineError::Other("The cut area doesn't fit at this position; nothing was moved.".into()));
     }
     edit(s, |cx| {
+        cx.formats_only = matches!(what, What::Formats);
         // Styles from another workbook must be re-interned.
         let mut style_map = std::collections::HashMap::new();
         let mut map_style = |id: StyleId, wb: &mut gridcraft_model::Workbook| -> StyleId {
@@ -1823,6 +1824,7 @@ fn format_painter(s: &mut Session, p: &Json) -> Result<Json> {
         let dest_sheet = s.doc()?.wb.active_sheet();
         let same = std::sync::Arc::ptr_eq(&wb, &s.doc()?.wb) || s.doc()?.wb.styles == wb.styles;
         edit(s, |cx| {
+            cx.formats_only = true;
             let Some(src_sheet) = wb.sheet(sheet) else { return Ok(()) };
             let (h, w) = (src.height(), src.width());
             let dest = if dest.is_single() { RangeRef::new(dest.start, dest.start.offset_clamped(h as i64 - 1, w as i64 - 1)) } else { dest };

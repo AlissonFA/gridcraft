@@ -338,6 +338,12 @@ pub struct Ctx<'a> {
     /// The command applied sheet protection itself (row/column inserts and deletes the
     /// protection allows), so cells it shifts aren't refused as edits of locked cells.
     pub protection_checked: bool,
+    /// Recalculate the whole workbook without making the edit structural: legacy arrays are still
+    /// checked (a table that grew changes what its structured references cover).
+    pub full_recalc: bool,
+    /// The command changed formats only (Format Painter, Paste Special › Formats): the cells it
+    /// touched hold no new entry, so tables next to them don't grow.
+    pub formats_only: bool,
 }
 
 pub(crate) fn edit<R>(s: &mut Session, f: impl FnOnce(&mut Ctx) -> Result<R>) -> Result<R> {
@@ -356,9 +362,18 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
     #[allow(clippy::disallowed_methods)]
     let t0 = if cfg!(target_arch = "wasm32") { None } else { std::env::var_os("GRIDCRAFT_PROFILE").map(|_| std::time::Instant::now()) };
     let mut sel = d.selection.clone();
-    let mut ctx = Ctx { wb: (*d.wb).clone(), changed: Vec::new(), structural: false, sel: &mut sel, fit_rows: Vec::new(), protection_checked: false };
+    let mut ctx = Ctx {
+        wb: (*d.wb).clone(),
+        changed: Vec::new(),
+        structural: false,
+        sel: &mut sel,
+        fit_rows: Vec::new(),
+        protection_checked: false,
+        full_recalc: false,
+        formats_only: false,
+    };
     let r = f(&mut ctx)?;
-    let Ctx { mut wb, changed, structural, mut fit_rows, protection_checked, .. } = ctx;
+    let Ctx { mut wb, changed, structural, mut fit_rows, protection_checked, full_recalc, .. } = ctx;
     if !protection_checked {
         check_protection(&d.wb, &wb, &d.unlocked_ranges)?;
     }
@@ -371,7 +386,7 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
     if let Some(t0) = t0 {
         eprintln!("commit: edit {:?}, {} changed", t0.elapsed(), changed.len());
     }
-    if structural {
+    if structural || full_recalc {
         d.calc.recalc_all(&mut wb);
     } else if !changed.is_empty() {
         d.calc.cells_changed(&mut wb, &changed);
