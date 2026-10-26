@@ -352,16 +352,43 @@ fn expand_pass(cx: &mut crate::cmd::Ctx, changed: &[(usize, CellRef)], rows: boo
                         tab_mut.range = new_range;
                     }
 
+                    // A column's validation covers the new row too, except cells that already have a
+                    // rule of their own (pasted with the entry, or set before): rules never overlap,
+                    // and the first one that covers a cell is the one that applies.
+                    let ruled: std::collections::HashSet<CellRef> =
+                        new_cells.iter().copied().filter(|&tc| sh_mut.validations.iter().any(|v| v.ranges.iter().any(|r| r.contains(tc)))).collect();
                     for val in &mut sh_mut.validations {
+                        let mut pieces = Vec::new();
                         for vr in &mut val.ranges {
-                            if old_end_row >= first_data_row
-                                && vr.end.row == old_end_row
-                                && vr.start.col >= t_range.start.col
-                                && vr.end.col <= t_range.end.col
+                            if old_end_row < first_data_row
+                                || vr.end.row != old_end_row
+                                || vr.start.col < t_range.start.col
+                                || vr.end.col > t_range.end.col
                             {
+                                continue;
+                            }
+                            let free = |col: u32| (old_end_row.saturating_add(1)..=new_end_row).all(|r| !ruled.contains(&CellRef::new(r, col)));
+                            if (vr.start.col..=vr.end.col).all(free) {
                                 vr.end.row = new_end_row;
+                                continue;
+                            }
+                            // Only the free runs of the new row join the rule.
+                            let mut run: Option<u32> = None;
+                            for col in vr.start.col..=vr.end.col.saturating_add(1) {
+                                match (run, col <= vr.end.col && free(col)) {
+                                    (None, true) => run = Some(col),
+                                    (Some(from), false) => {
+                                        pieces.push(RangeRef::new(
+                                            CellRef::new(old_end_row.saturating_add(1), from),
+                                            CellRef::new(new_end_row, col.saturating_sub(1)),
+                                        ));
+                                        run = None;
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
+                        val.ranges.extend(pieces);
                     }
 
                     for &target_cell in &new_cells {
@@ -1128,6 +1155,50 @@ mod tests {
         s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
         s.execute("range.setValues", json!({"range": "B3", "values": [[3, 4]]})).unwrap();
         assert_eq!(range(&s), "A1:C3");
+    }
+
+    #[test]
+    fn table_auto_expand_never_lays_the_column_validation_over_a_cell_rule() {
+        let rules = |s: &Session| -> Vec<Vec<String>> {
+            s.doc().unwrap().wb.sheet(0).unwrap().validations.iter().map(|v| v.ranges.iter().map(|r| r.a1()).collect()).collect()
+        };
+        let table = || {
+            let mut s = Session::new();
+            s.new_workbook();
+            s.execute("range.setValues", json!({"range": "A1", "values": [["A"], ["x"]]})).unwrap();
+            s.execute("insert.table", json!({"range": "A1:A2", "header": true})).unwrap();
+            s.execute("data.validation", json!({"range": "A2", "type": "list", "formula1": "x,y"})).unwrap();
+            s
+        };
+
+        // A cell pasted with its own rule keeps it: the column's list doesn't cover it as well.
+        let mut s = table();
+        s.execute("cell.set", json!({"cell": "D1", "input": "5"})).unwrap();
+        s.execute("data.validation", json!({"range": "D1", "type": "whole", "operator": "between", "formula1": "1", "formula2": "9"})).unwrap();
+        s.execute("selection.set", json!({"range": "D1"})).unwrap();
+        s.execute("edit.copy", json!({})).unwrap();
+        s.execute("selection.set", json!({"range": "A3"})).unwrap();
+        s.execute("edit.paste", json!({})).unwrap();
+        assert_eq!(range(&s), "A1:A3");
+        assert_eq!(rules(&s), [vec!["A2"], vec!["D1"], vec!["A3"]]);
+
+        // So does a rule the cell had before the entry.
+        let mut s = table();
+        s.execute("data.validation", json!({"range": "A3", "type": "whole", "operator": "between", "formula1": "1", "formula2": "9"})).unwrap();
+        s.execute("cell.set", json!({"cell": "A3", "input": "5"})).unwrap();
+        assert_eq!(range(&s), "A1:A3");
+        assert_eq!(rules(&s), [vec!["A2"], vec!["A3"]]);
+
+        // A rule over several columns takes in only the free part of the new row.
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B", "C"], ["x", "x", "x"]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:C2", "header": true})).unwrap();
+        s.execute("data.validation", json!({"range": "A2:C2", "type": "list", "formula1": "x,y"})).unwrap();
+        s.execute("data.validation", json!({"range": "B3", "type": "whole", "operator": "between", "formula1": "1", "formula2": "9"})).unwrap();
+        s.execute("cell.set", json!({"cell": "A3", "input": "y"})).unwrap();
+        assert_eq!(range(&s), "A1:C3");
+        assert_eq!(rules(&s), [vec!["A2:C2", "A3", "C3"], vec!["B3"]]);
     }
 
     #[test]
