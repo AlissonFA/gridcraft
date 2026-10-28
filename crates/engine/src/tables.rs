@@ -346,7 +346,6 @@ fn expand_pass(cx: &mut crate::cmd::Ctx, changed: &[(usize, CellRef)], rows: boo
                         .collect(),
                     None => continue,
                 };
-                let mut touched = Vec::new();
                 if let Some(sh_mut) = cx.wb.sheet_mut(si) {
                     if let Some(tab_mut) = sh_mut.tables.get_mut(ti) {
                         tab_mut.range = new_range;
@@ -427,15 +426,18 @@ fn expand_pass(cx: &mut crate::cmd::Ctx, changed: &[(usize, CellRef)], rows: boo
                         if let Some(shifted) = shifted {
                             let formula = Some(std::sync::Arc::new(shifted));
                             sh_mut.set_cell(target_cell, Cell { value: gridcraft_core::Value::Empty, formula, style });
-                            touched.push(target_cell);
                         } else if style != own_style {
                             sh_mut.set_cell(target_cell, Cell { value: gridcraft_core::Value::Empty, formula: None, style });
                         }
                     }
                 }
-                cx.full_recalc = true;
-                for tc in touched {
-                    cx.touch(si, tc);
+                // Every cell of the new row is now in the table, empty or not: formulas over the
+                // table's columns (ROWS, COUNTBLANK, SUM…) recalculate through them.
+                cx.rebuild_deps = true;
+                for r in old_end_row.saturating_add(1)..=new_end_row {
+                    for col in t_range.start.col..=t_range.end.col {
+                        cx.touch(si, CellRef::new(r, col));
+                    }
                 }
             }
 
@@ -477,11 +479,12 @@ fn expand_pass(cx: &mut crate::cmd::Ctx, changed: &[(usize, CellRef)], rows: boo
                             unique_name: None,
                             xml: None,
                         });
-                        cx.full_recalc = true;
+                        cx.rebuild_deps = true;
                     }
                 }
-                if write_header {
-                    cx.touch(si, header_cell);
+                // Likewise every cell of the new column, its header included.
+                for r in t_range.start.row..=t_range.end.row {
+                    cx.touch(si, CellRef::new(r, c.col));
                 }
             }
         }
@@ -1199,6 +1202,49 @@ mod tests {
         s.execute("cell.set", json!({"cell": "A3", "input": "y"})).unwrap();
         assert_eq!(range(&s), "A1:C3");
         assert_eq!(rules(&s), [vec!["A2:C2", "A3", "C3"], vec!["B3"]]);
+    }
+
+    #[test]
+    fn table_auto_expand_keeps_manual_calculation_manual() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A"], [1]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:A2", "header": true})).unwrap();
+        s.execute("cell.set", json!({"cell": "E1", "input": 1})).unwrap();
+        s.execute("cell.set", json!({"cell": "D1", "input": "=E1*2"})).unwrap();
+        s.execute("formulas.calculationOptions", json!({"mode": "manual"})).unwrap();
+
+        // In manual mode D1 waits for F9 after E1 changes, and a table growing doesn't run it.
+        s.execute("cell.set", json!({"cell": "E1", "input": 5})).unwrap();
+        s.execute("cell.set", json!({"cell": "A3", "input": 7})).unwrap();
+        assert_eq!(range(&s), "A1:A3");
+        let get = |s: &mut Session, a: &str| s.execute("cell.get", json!({"cell": a})).unwrap()["value"].clone();
+        assert_eq!(get(&mut s, "D1"), json!(2.0));
+        s.execute("formulas.calculateNow", json!({})).unwrap();
+        assert_eq!(get(&mut s, "D1"), json!(10.0));
+    }
+
+    #[test]
+    fn table_auto_expand_recalculates_formulas_over_the_table() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B"], [1, 2], [3, 4]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B3", "header": true})).unwrap();
+        s.execute("cell.set", json!({"cell": "F1", "input": "=ROWS(Table1[B])"})).unwrap();
+        s.execute("cell.set", json!({"cell": "G1", "input": "=COUNTBLANK(Table1[B])"})).unwrap();
+        s.execute("cell.set", json!({"cell": "H1", "input": "=COLUMNS(Table1)"})).unwrap();
+        let get = |s: &mut Session, a: &str| s.execute("cell.get", json!({"cell": a})).unwrap()["value"].clone();
+        assert_eq!((get(&mut s, "F1"), get(&mut s, "G1"), get(&mut s, "H1")), (json!(2.0), json!(0.0), json!(2.0)));
+
+        // A new row whose B cell stays empty: the row count and the blank count both move.
+        s.execute("cell.set", json!({"cell": "A4", "input": 5})).unwrap();
+        assert_eq!(range(&s), "A1:B4");
+        assert_eq!((get(&mut s, "F1"), get(&mut s, "G1")), (json!(3.0), json!(1.0)));
+
+        // A new column moves the column count.
+        s.execute("cell.set", json!({"cell": "C2", "input": 9})).unwrap();
+        assert_eq!(range(&s), "A1:C4");
+        assert_eq!(get(&mut s, "H1"), json!(3.0));
     }
 
     #[test]

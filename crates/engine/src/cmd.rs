@@ -338,9 +338,10 @@ pub struct Ctx<'a> {
     /// The command applied sheet protection itself (row/column inserts and deletes the
     /// protection allows), so cells it shifts aren't refused as edits of locked cells.
     pub protection_checked: bool,
-    /// Recalculate the whole workbook without making the edit structural: legacy arrays are still
-    /// checked (a table that grew changes what its structured references cover).
-    pub full_recalc: bool,
+    /// A table grew, so its structured references cover more cells: the dependency graph is built
+    /// again before the usual recalculation of what the changed cells feed (only the edited
+    /// formulas in manual mode). The edit isn't structural, so legacy arrays are still checked.
+    pub rebuild_deps: bool,
     /// The command enters data (typing, setValues, fill, paste): the cells it filled next to a
     /// table grow it. Other commands that rewrite or move cells (sort, Format Painter, checkboxes)
     /// leave tables as they are.
@@ -370,11 +371,11 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
         sel: &mut sel,
         fit_rows: Vec::new(),
         protection_checked: false,
-        full_recalc: false,
+        rebuild_deps: false,
         entry: false,
     };
     let r = f(&mut ctx)?;
-    let Ctx { mut wb, changed, structural, mut fit_rows, protection_checked, full_recalc, .. } = ctx;
+    let Ctx { mut wb, changed, structural, mut fit_rows, protection_checked, rebuild_deps, .. } = ctx;
     if !protection_checked {
         check_protection(&d.wb, &wb, &d.unlocked_ranges)?;
     }
@@ -387,8 +388,11 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
     if let Some(t0) = t0 {
         eprintln!("commit: edit {:?}, {} changed", t0.elapsed(), changed.len());
     }
-    if structural || full_recalc {
+    if structural {
         d.calc.recalc_all(&mut wb);
+    } else if rebuild_deps {
+        d.calc.rebuild(&wb);
+        d.calc.cells_changed(&mut wb, &changed);
     } else if !changed.is_empty() {
         d.calc.cells_changed(&mut wb, &changed);
     }
